@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@(ViewData["Title"] is string title ? $"{title} · " : "")SQL Restore Manager</title>
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
+</head>
+<body>
+<header>
+    <strong>SQL Restore Manager</strong>
+    <nav>
+        <a asp-controller="Restore" asp-action="Index">Restaurar</a>
+        <a asp-controller="History" asp-action="Index">Histórico</a>
+    </nav>
+</header>
+<main>@RenderBody()</main>
+@await RenderSectionAsync("Scripts", required: false)
+</body>
+</html>

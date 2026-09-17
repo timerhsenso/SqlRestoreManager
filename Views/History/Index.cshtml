@@ -1,0 +1,57 @@
+@model IEnumerable<RestoreHistory>
+@{
+    ViewData["Title"] = "Histórico";
+}
+<section class="card wide">
+    <h1>Histórico de restores</h1>
+    <div class="table-scroll">
+        <table>
+            <thead>
+                <tr>
+                    <th>Início</th>
+                    <th>Arquivo</th>
+                    <th>Origem</th>
+                    <th>Destino</th>
+                    <th>Backup de</th>
+                    <th>Status</th>
+                    <th>Progresso</th>
+                    <th>Conexões encerradas</th>
+                    <th>Fim</th>
+                    <th>Instância</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (!Model.Any())
+                {
+                    <tr><td colspan="10">Nenhum restore executado ainda.</td></tr>
+                }
+                @foreach (var x in Model)
+                {
+                    var statusClass = RestoreStatus.IsActive(x.Status) ? "status-active" : $"status-{x.Status}";
+                    <tr>
+                        <td>@x.StartedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
+                        <td>@x.OriginalFileName<div class="muted">@((x.FileSizeBytes / 1024d / 1024d).ToString("N1")) MB</div></td>
+                        <td>@x.SourceDatabase<div class="muted">@x.BackupServerName</div></td>
+                        <td>@x.TargetDatabase</td>
+                        <td>@(x.BackupFinishDate?.ToString("dd/MM/yyyy HH:mm") ?? "-")</td>
+                        <td>
+                            <span class="status @statusClass">@RestoreStatus.ToLabel(x.Status)</span>
+                            @if (RestoreStatus.IsActive(x.Status) && !string.IsNullOrWhiteSpace(x.CurrentStep))
+                            {
+                                <div class="muted">@x.CurrentStep</div>
+                            }
+                        </td>
+                        <td>@x.PercentComplete%</td>
+                        <td>@x.DisconnectedSessions</td>
+                        <td>@(x.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss") ?? "-")</td>
+                        <td>@(x.NodeName ?? "-")</td>
+                    </tr>
+                    if (!string.IsNullOrWhiteSpace(x.ErrorMessage))
+                    {
+                        <tr><td colspan="10" class="error">@x.ErrorMessage</td></tr>
+                    }
+                }
+            </tbody>
+        </table>
+    </div>
+</section>

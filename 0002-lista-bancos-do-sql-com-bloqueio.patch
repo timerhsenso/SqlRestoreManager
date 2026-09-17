@@ -1,0 +1,704 @@
+From 03d19cd45165378112565cde119a6b4ee4f85c3c Mon Sep 17 00:00:00 2001
+From: claude <c@x>
+Date: Thu, 17 Sep 2026 16:07:19 +0000
+Subject: [PATCH] =?UTF-8?q?Lista=20de=20bancos=20lida=20do=20SQL=20Server?=
+ =?UTF-8?q?=20com=20bloqueio=20configur=C3=A1vel?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Configuration/RestoreOptions.cs          |  14 +++-
+ Configuration/RestoreOptionsValidator.cs |  32 ++------
+ Controllers/RestoreController.cs         |  35 ++++++--
+ Models/RestoreIndexViewModel.cs          |  10 +++
+ Program.cs                               |   6 +-
+ README.md                                |   5 +-
+ Services/Sql/DatabaseCatalog.cs          | 100 +++++++++++++++++++++++
+ Services/Sql/DatabasePolicy.cs           |  82 +++++++++++++++++++
+ Services/Sql/DatabaseWhitelist.cs        |  32 --------
+ Services/Sql/SqlConnectionFactory.cs     |  47 +++++++++++
+ Services/Sql/SqlRestoreService.cs        |  51 ++++--------
+ Views/Restore/Index.cshtml               |  23 +++++-
+ 12 files changed, 323 insertions(+), 114 deletions(-)
+ create mode 100644 Models/RestoreIndexViewModel.cs
+ create mode 100644 Services/Sql/DatabaseCatalog.cs
+ create mode 100644 Services/Sql/DatabasePolicy.cs
+ delete mode 100644 Services/Sql/DatabaseWhitelist.cs
+ create mode 100644 Services/Sql/SqlConnectionFactory.cs
+
+diff --git a/Configuration/RestoreOptions.cs b/Configuration/RestoreOptions.cs
+index 06b803d..d9a1ab4 100644
+--- a/Configuration/RestoreOptions.cs
++++ b/Configuration/RestoreOptions.cs
+@@ -15,7 +15,6 @@ public sealed class RestoreOptions
+     /// <summary>
+     /// Mesma pasta de <see cref="TempPath"/>, porém como o SQL Server a enxerga.
+     /// Vazio = igual ao TempPath (app e SQL na mesma máquina).
+-    /// Ex.: dev usa TempPath = \\SERVIDOR\RestoreTemp e SqlServerTempPath = D:\RestoreManager\Temp.
+     /// </summary>
+     public string? SqlServerTempPath { get; set; }
+ 
+@@ -40,8 +39,17 @@ public sealed class RestoreOptions
+     /// <summary>Identifica a instância no histórico. Vazio = nome da máquina.</summary>
+     public string? NodeName { get; set; }
+ 
+-    /// <summary>Whitelist de bancos que podem ser sobrescritos.</summary>
+-    public List<string> AllowedDatabases { get; set; } = new();
++    /// <summary>
++    /// Bancos que NÃO podem ser restaurados. Aceita curingas: * (qualquer sequência) e ? (um caractere).
++    /// Ex.: "banco01", "PROD_*", "ReportServer*". Comparação sem diferenciar maiúsculas.
++    /// Bancos de sistema e o banco de histórico já são bloqueados automaticamente.
++    /// </summary>
++    public List<string> BlockedDatabases { get; set; } = new();
++
++    /// <summary>
++    /// true = bancos bloqueados aparecem na lista desabilitados; false = não aparecem.
++    /// </summary>
++    public bool ShowBlockedDatabases { get; set; } = true;
+ 
+     public string EffectiveNodeName =>
+         string.IsNullOrWhiteSpace(NodeName) ? Environment.MachineName : NodeName.Trim();
+diff --git a/Configuration/RestoreOptionsValidator.cs b/Configuration/RestoreOptionsValidator.cs
+index c7c29f8..3acd2d9 100644
+--- a/Configuration/RestoreOptionsValidator.cs
++++ b/Configuration/RestoreOptionsValidator.cs
+@@ -12,12 +12,6 @@ public sealed partial class RestoreOptionsValidator : IValidateOptions<RestoreOp
+     /// <summary>Limite imposto pelo IIS (requestLimits/maxAllowedContentLength é uint).</summary>
+     public const int IisMaxUploadMB = 4000;
+ 
+-    public static readonly IReadOnlySet<string> SystemDatabases =
+-        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+-        {
+-            "master", "model", "msdb", "tempdb", "distribution", "SSISDB"
+-        };
+-
+     public ValidateOptionsResult Validate(string? name, RestoreOptions o)
+     {
+         var errors = new List<string>();
+@@ -41,31 +35,15 @@ public sealed partial class RestoreOptionsValidator : IValidateOptions<RestoreOp
+         if (o.TempRetentionHours < 1)
+             errors.Add("Restore:TempRetentionHours deve ser maior que zero.");
+ 
+-        if (o.AllowedDatabases.Count == 0)
+-            errors.Add("Restore:AllowedDatabases deve conter ao menos um banco.");
+-
+-        foreach (var db in o.AllowedDatabases)
++        foreach (var pattern in o.BlockedDatabases)
+         {
+-            if (string.IsNullOrWhiteSpace(db) || !DatabaseNameRegex().IsMatch(db))
+-                errors.Add($"Restore:AllowedDatabases contém nome inválido: '{db}'. Use letras, números, '_' ou '-'.");
+-            else if (SystemDatabases.Contains(db))
+-                errors.Add($"Restore:AllowedDatabases não pode conter banco de sistema: '{db}'.");
++            if (string.IsNullOrWhiteSpace(pattern) || !BlockedPatternRegex().IsMatch(pattern))
++                errors.Add($"Restore:BlockedDatabases contém padrão inválido: '{pattern}'.");
+         }
+ 
+-        var duplicates = o.AllowedDatabases
+-            .GroupBy(x => x, StringComparer.OrdinalIgnoreCase)
+-            .Where(g => g.Count() > 1)
+-            .Select(g => g.Key)
+-            .ToList();
+-
+-        if (duplicates.Count > 0)
+-            errors.Add($"Restore:AllowedDatabases contém duplicados: {string.Join(", ", duplicates)}.");
+-
+         return errors.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(errors);
+     }
+ 
+-    public static bool IsValidDatabaseName(string name) => DatabaseNameRegex().IsMatch(name);
+-
+     private static void ValidateServerPath(string? path, string key, List<string> errors)
+     {
+         if (string.IsNullOrWhiteSpace(path))
+@@ -75,8 +53,8 @@ public sealed partial class RestoreOptionsValidator : IValidateOptions<RestoreOp
+             errors.Add($"{key} deve ser um caminho absoluto Windows (ex.: D:\\Pasta ou \\\\servidor\\share).");
+     }
+ 
+-    [GeneratedRegex(@"^[A-Za-z0-9_\-]{1,128}$")]
+-    private static partial Regex DatabaseNameRegex();
++    [GeneratedRegex(@"^[\p{L}\p{N}_\-\. \*\?]{1,128}$")]
++    private static partial Regex BlockedPatternRegex();
+ 
+     [GeneratedRegex(@"^([A-Za-z]:\\|\\\\[^\\]+\\[^\\]+)")]
+     private static partial Regex WindowsAbsolutePathRegex();
+diff --git a/Controllers/RestoreController.cs b/Controllers/RestoreController.cs
+index d8aec03..6e6cde0 100644
+--- a/Controllers/RestoreController.cs
++++ b/Controllers/RestoreController.cs
+@@ -17,7 +17,7 @@ public sealed class RestoreController : Controller
+     /// <summary>Folga para cabeçalhos/boundaries do multipart.</summary>
+     private const long MultipartOverheadBytes = 1024 * 1024;
+ 
+-    private readonly DatabaseWhitelist _whitelist;
++    private readonly DatabaseCatalog _catalog;
+     private readonly RestoreQueue _queue;
+     private readonly AppDbContext _db;
+     private readonly SqlRestoreService _sql;
+@@ -26,7 +26,7 @@ public sealed class RestoreController : Controller
+     private readonly ILogger<RestoreController> _logger;
+ 
+     public RestoreController(
+-        DatabaseWhitelist whitelist,
++        DatabaseCatalog catalog,
+         RestoreQueue queue,
+         AppDbContext db,
+         SqlRestoreService sql,
+@@ -34,7 +34,7 @@ public sealed class RestoreController : Controller
+         IOptions<RestoreOptions> options,
+         ILogger<RestoreController> logger)
+     {
+-        _whitelist = whitelist;
++        _catalog = catalog;
+         _queue = queue;
+         _db = db;
+         _sql = sql;
+@@ -44,11 +44,22 @@ public sealed class RestoreController : Controller
+     }
+ 
+     [HttpGet]
+-    public IActionResult Index()
++    public async Task<IActionResult> Index(CancellationToken ct)
+     {
+-        ViewBag.Databases = _whitelist.All;
+-        ViewBag.MaxUploadMB = _options.MaxUploadMB;
+-        return View();
++        try
++        {
++            var databases = await _catalog.ListAsync(ct);
++            return View(new RestoreIndexViewModel { Databases = databases, MaxUploadMB = _options.MaxUploadMB });
++        }
++        catch (Exception ex) when (!ct.IsCancellationRequested)
++        {
++            _logger.LogError(ex, "Falha ao listar os bancos do servidor.");
++            return View(new RestoreIndexViewModel
++            {
++                MaxUploadMB = _options.MaxUploadMB,
++                LoadError = SqlErrorTranslator.Translate(ex)
++            });
++        }
+     }
+ 
+     [HttpGet]
+@@ -56,7 +67,7 @@ public sealed class RestoreController : Controller
+     {
+         try
+         {
+-            var sessions = await _sql.GetSessionsAsync(_whitelist.Resolve(database), ct);
++            var sessions = await _sql.GetSessionsAsync(database ?? string.Empty, ct);
+             return Json(sessions);
+         }
+         catch (RestoreValidationException ex)
+@@ -93,12 +104,18 @@ public sealed class RestoreController : Controller
+         string database;
+         try
+         {
+-            database = _whitelist.Resolve(targetDatabase);
++            database = await _catalog.ResolveAsync(targetDatabase, ct);
+         }
+         catch (RestoreValidationException ex)
+         {
+             return StatusCode(ex.StatusCode, ex.Message);
+         }
++        catch (Exception ex) when (!ct.IsCancellationRequested)
++        {
++            _logger.LogError(ex, "Falha ao validar o banco de destino.");
++            return StatusCode(StatusCodes.Status503ServiceUnavailable,
++                $"Não foi possível consultar o servidor SQL. {SqlErrorTranslator.Translate(ex)}");
++        }
+ 
+         ConfigureRequestBodyLimit();
+ 
+diff --git a/Models/RestoreIndexViewModel.cs b/Models/RestoreIndexViewModel.cs
+new file mode 100644
+index 0000000..236774f
+--- /dev/null
++++ b/Models/RestoreIndexViewModel.cs
+@@ -0,0 +1,10 @@
++using SqlRestoreManager.Services.Sql;
++
++namespace SqlRestoreManager.Models;
++
++public sealed class RestoreIndexViewModel
++{
++    public IReadOnlyList<DatabaseInfo> Databases { get; init; } = [];
++    public int MaxUploadMB { get; init; }
++    public string? LoadError { get; init; }
++}
+diff --git a/Program.cs b/Program.cs
+index a9f0516..78e334a 100644
+--- a/Program.cs
++++ b/Program.cs
+@@ -35,7 +35,11 @@ builder.Services.AddDbContext<AppDbContext>(o =>
+     o.UseSqlServer(historyConnection, sql => sql.EnableRetryOnFailure(3)));
+ 
+ // ---------------------------------------------------------------- Serviços
+-builder.Services.AddSingleton<DatabaseWhitelist>();
++builder.Services.AddSingleton<SqlConnectionFactory>();
++builder.Services.AddSingleton(sp => new DatabasePolicy(
++    sp.GetRequiredService<IOptions<RestoreOptions>>().Value,
++    sp.GetRequiredService<SqlConnectionFactory>().HistoryDatabaseName));
++builder.Services.AddSingleton<DatabaseCatalog>();
+ builder.Services.AddSingleton<BackupPathMapper>();
+ builder.Services.AddSingleton<SqlRestoreService>();
+ builder.Services.AddSingleton<BackupUploadService>();
+diff --git a/README.md b/README.md
+index 2f30451..aed9d15 100644
+--- a/README.md
++++ b/README.md
+@@ -36,7 +36,10 @@ Aplicação ASP.NET Core 8 MVC para restaurar bancos SQL Server pelo navegador
+ | `ProgressPollSeconds` | Intervalo de leitura do progresso. |
+ | `TempRetentionHours` | Idade mínima para limpeza de pastas temporárias órfãs. |
+ | `NodeName` | Nome da instância no histórico. Vazio = nome da máquina. |
+-| `AllowedDatabases` | Whitelist (bancos de sistema são recusados no startup). |
++| `BlockedDatabases` | Bancos que não podem ser restaurados. Aceita `*` e `?` (ex.: `PROD_*`). |
++| `ShowBlockedDatabases` | `true` = bloqueados aparecem desabilitados; `false` = ficam ocultos. |
++
++A lista de destino vem de `sys.databases` do servidor. Bancos de sistema (`master`, `model`, `msdb`, `tempdb`, `distribution`, `SSISDB`) nunca aparecem, e o banco de histórico (`HistoryConnection`) aparece sempre bloqueado. O banco de destino precisa já existir no servidor e é revalidado no upload e novamente no início do restore.
+ 
+ A aplicação **não sobe** se a configuração for inválida (`ValidateOnStart`).
+ 
+diff --git a/Services/Sql/DatabaseCatalog.cs b/Services/Sql/DatabaseCatalog.cs
+new file mode 100644
+index 0000000..7ecd430
+--- /dev/null
++++ b/Services/Sql/DatabaseCatalog.cs
+@@ -0,0 +1,100 @@
++namespace SqlRestoreManager.Services.Sql;
++
++public sealed record DatabaseInfo(string Name, string State, bool CanRestore, string? Reason)
++{
++    public string Label
++    {
++        get
++        {
++            var label = Name;
++            if (!string.Equals(State, "ONLINE", StringComparison.OrdinalIgnoreCase))
++                label += $" ({State})";
++            if (Reason is not null)
++                label += $" - {Reason}";
++            return label;
++        }
++    }
++}
++
++/// <summary>
++/// Lista os bancos reais do servidor aplicando <see cref="DatabasePolicy"/>.
++/// Também é a única porta de entrada para nomes de banco vindos do usuário.
++/// </summary>
++public sealed class DatabaseCatalog
++{
++    private readonly SqlConnectionFactory _connections;
++    private readonly DatabasePolicy _policy;
++
++    public DatabaseCatalog(SqlConnectionFactory connections, DatabasePolicy policy)
++    {
++        _connections = connections;
++        _policy = policy;
++    }
++
++    public async Task<IReadOnlyList<DatabaseInfo>> ListAsync(CancellationToken ct = default)
++    {
++        await using var cn = await _connections.OpenMasterAsync(ct);
++        await using var cmd = cn.CreateCommand();
++        cmd.CommandTimeout = 30;
++        cmd.CommandText = """
++            SELECT d.name,
++                   d.state_desc,
++                   CAST(d.is_distributor AS bit)
++            FROM sys.databases AS d
++            WHERE d.database_id > 4
++            ORDER BY d.name;
++            """;
++
++        var result = new List<DatabaseInfo>();
++        await using var rd = await cmd.ExecuteReaderAsync(ct);
++        while (await rd.ReadAsync(ct))
++        {
++            var name = rd.GetString(0);
++            var policy = _policy.Evaluate(name, rd.GetBoolean(2));
++            if (policy.Visibility == DatabaseVisibility.Hidden)
++                continue;
++
++            result.Add(new DatabaseInfo(
++                name,
++                rd.GetString(1),
++                policy.Visibility == DatabaseVisibility.Allowed,
++                policy.Reason));
++        }
++
++        return result;
++    }
++
++    /// <summary>
++    /// Valida o nome informado contra o servidor e as regras.
++    /// Retorna o nome exatamente como está no SQL Server.
++    /// </summary>
++    public async Task<string> ResolveAsync(string? database, CancellationToken ct = default)
++    {
++        if (string.IsNullOrWhiteSpace(database))
++            throw new RestoreValidationException("Informe o banco de destino.");
++
++        var requested = database.Trim();
++
++        // Checagem prévia sem I/O (bancos de sistema/bloqueados/nomes inválidos).
++        var policy = _policy.Evaluate(requested);
++        if (policy.Visibility != DatabaseVisibility.Allowed)
++            throw new RestoreValidationException(
++                $"O banco '{requested}' não pode ser restaurado ({policy.Reason}).",
++                StatusCodes.Status403Forbidden);
++
++        var databases = await ListAsync(ct);
++        var match = databases.FirstOrDefault(d => string.Equals(d.Name, requested, StringComparison.Ordinal))
++                    ?? databases.SingleOrDefault(d => string.Equals(d.Name, requested, StringComparison.OrdinalIgnoreCase));
++
++        if (match is null)
++            throw new RestoreValidationException(
++                $"O banco '{requested}' não existe no servidor.", StatusCodes.Status404NotFound);
++
++        if (!match.CanRestore)
++            throw new RestoreValidationException(
++                $"O banco '{match.Name}' não pode ser restaurado ({match.Reason}).",
++                StatusCodes.Status403Forbidden);
++
++        return match.Name;
++    }
++}
+diff --git a/Services/Sql/DatabasePolicy.cs b/Services/Sql/DatabasePolicy.cs
+new file mode 100644
+index 0000000..00969d0
+--- /dev/null
++++ b/Services/Sql/DatabasePolicy.cs
+@@ -0,0 +1,82 @@
++using System.Text.RegularExpressions;
++using SqlRestoreManager.Configuration;
++
++namespace SqlRestoreManager.Services.Sql;
++
++public enum DatabaseVisibility
++{
++    /// <summary>Não aparece na lista.</summary>
++    Hidden,
++
++    /// <summary>Aparece desabilitado.</summary>
++    Disabled,
++
++    /// <summary>Pode ser restaurado.</summary>
++    Allowed
++}
++
++public sealed record DatabasePolicyResult(DatabaseVisibility Visibility, string? Reason);
++
++/// <summary>
++/// Regras (puras, sem I/O) que decidem se um banco do servidor pode ser restaurado.
++/// </summary>
++public sealed partial class DatabasePolicy
++{
++    private static readonly IReadOnlySet<string> SystemDatabases =
++        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
++        {
++            "master", "model", "msdb", "tempdb", "distribution", "SSISDB"
++        };
++
++    private readonly Regex[] _blocked;
++    private readonly bool _showBlocked;
++    private readonly string? _historyDatabase;
++
++    public DatabasePolicy(RestoreOptions options, string? historyDatabase)
++    {
++        _blocked = options.BlockedDatabases
++            .Where(p => !string.IsNullOrWhiteSpace(p))
++            .Select(ToRegex)
++            .ToArray();
++        _showBlocked = options.ShowBlockedDatabases;
++        _historyDatabase = historyDatabase;
++    }
++
++    public DatabasePolicyResult Evaluate(string name, bool isDistributor = false)
++    {
++        if (SystemDatabases.Contains(name) || isDistributor)
++            return new(DatabaseVisibility.Hidden, "banco de sistema");
++
++        if (_historyDatabase is not null &&
++            string.Equals(name, _historyDatabase, StringComparison.OrdinalIgnoreCase))
++            return new(DatabaseVisibility.Disabled, "usado pelo Restore Manager");
++
++        if (_blocked.Any(r => r.IsMatch(name)))
++            return new(_showBlocked ? DatabaseVisibility.Disabled : DatabaseVisibility.Hidden, "bloqueado");
++
++        if (!IsSupportedName(name))
++            return new(DatabaseVisibility.Disabled, "nome não suportado");
++
++        return new(DatabaseVisibility.Allowed, null);
++    }
++
++    /// <summary>
++    /// O nome vira nome de arquivo (.mdf/.ldf): só letras, números, espaço, '_', '-' e '.'.
++    /// </summary>
++    public static bool IsSupportedName(string name) =>
++        !string.IsNullOrWhiteSpace(name) &&
++        name == name.Trim() &&
++        !name.EndsWith('.') &&
++        SupportedNameRegex().IsMatch(name);
++
++    private static Regex ToRegex(string pattern)
++    {
++        var body = Regex.Escape(pattern.Trim())
++            .Replace(@"\*", ".*")
++            .Replace(@"\?", ".");
++        return new Regex($"^{body}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
++    }
++
++    [GeneratedRegex(@"^[\p{L}\p{N}_\-\. ]{1,128}$")]
++    private static partial Regex SupportedNameRegex();
++}
+diff --git a/Services/Sql/DatabaseWhitelist.cs b/Services/Sql/DatabaseWhitelist.cs
+deleted file mode 100644
+index 2a7f458..0000000
+--- a/Services/Sql/DatabaseWhitelist.cs
++++ /dev/null
+@@ -1,32 +0,0 @@
+-using Microsoft.Extensions.Options;
+-using SqlRestoreManager.Configuration;
+-
+-namespace SqlRestoreManager.Services.Sql;
+-
+-/// <summary>
+-/// Única porta de entrada para nomes de banco vindos do usuário.
+-/// Sempre devolve o nome exatamente como está na configuração.
+-/// </summary>
+-public sealed class DatabaseWhitelist
+-{
+-    private readonly RestoreOptions _options;
+-
+-    public DatabaseWhitelist(IOptions<RestoreOptions> options) => _options = options.Value;
+-
+-    public IReadOnlyList<string> All => _options.AllowedDatabases;
+-
+-    public string Resolve(string? database)
+-    {
+-        if (string.IsNullOrWhiteSpace(database))
+-            throw new RestoreValidationException("Informe o banco de destino.");
+-
+-        var match = _options.AllowedDatabases.FirstOrDefault(x =>
+-            string.Equals(x, database.Trim(), StringComparison.OrdinalIgnoreCase));
+-
+-        if (match is null || !RestoreOptionsValidator.IsValidDatabaseName(match))
+-            throw new RestoreValidationException(
+-                "Banco não autorizado para restore.", StatusCodes.Status403Forbidden);
+-
+-        return match;
+-    }
+-}
+diff --git a/Services/Sql/SqlConnectionFactory.cs b/Services/Sql/SqlConnectionFactory.cs
+new file mode 100644
+index 0000000..b79957a
+--- /dev/null
++++ b/Services/Sql/SqlConnectionFactory.cs
+@@ -0,0 +1,47 @@
++using Microsoft.Data.SqlClient;
++
++namespace SqlRestoreManager.Services.Sql;
++
++/// <summary>
++/// Cria conexões administrativas (sempre no master) e expõe o nome do banco de histórico.
++/// </summary>
++public sealed class SqlConnectionFactory
++{
++    private readonly string _masterConnectionString;
++
++    public SqlConnectionFactory(IConfiguration configuration)
++    {
++        var admin = configuration.GetConnectionString("SqlAdminConnection")
++            ?? throw new InvalidOperationException("ConnectionStrings:SqlAdminConnection não configurada.");
++
++        var builder = new SqlConnectionStringBuilder(admin) { InitialCatalog = "master" };
++        if (string.IsNullOrWhiteSpace(builder.ApplicationName) ||
++            builder.ApplicationName == "Core Microsoft SqlClient Data Provider")
++            builder.ApplicationName = "SqlRestoreManager";
++
++        _masterConnectionString = builder.ConnectionString;
++
++        var history = configuration.GetConnectionString("HistoryConnection");
++        HistoryDatabaseName = string.IsNullOrWhiteSpace(history)
++            ? null
++            : new SqlConnectionStringBuilder(history).InitialCatalog;
++    }
++
++    /// <summary>Banco usado pelo histórico — nunca pode ser restaurado.</summary>
++    public string? HistoryDatabaseName { get; }
++
++    public async Task<SqlConnection> OpenMasterAsync(CancellationToken ct)
++    {
++        var cn = new SqlConnection(_masterConnectionString);
++        try
++        {
++            await cn.OpenAsync(ct);
++            return cn;
++        }
++        catch
++        {
++            await cn.DisposeAsync();
++            throw;
++        }
++    }
++}
+diff --git a/Services/Sql/SqlRestoreService.cs b/Services/Sql/SqlRestoreService.cs
+index 2952729..84958d5 100644
+--- a/Services/Sql/SqlRestoreService.cs
++++ b/Services/Sql/SqlRestoreService.cs
+@@ -16,29 +16,20 @@ public sealed class SqlRestoreService
+     private const int ShortTimeoutSeconds = 120;
+     private const string LockResourcePrefix = "SqlRestoreManager:";
+ 
+-    private readonly string _connectionString;
++    private readonly SqlConnectionFactory _connections;
++    private readonly DatabaseCatalog _catalog;
+     private readonly RestoreOptions _options;
+-    private readonly DatabaseWhitelist _whitelist;
+     private readonly ILogger<SqlRestoreService> _logger;
+ 
+     public SqlRestoreService(
+-        IConfiguration configuration,
++        SqlConnectionFactory connections,
++        DatabaseCatalog catalog,
+         IOptions<RestoreOptions> options,
+-        DatabaseWhitelist whitelist,
+         ILogger<SqlRestoreService> logger)
+     {
+-        var raw = configuration.GetConnectionString("SqlAdminConnection")
+-            ?? throw new InvalidOperationException("ConnectionStrings:SqlAdminConnection não configurada.");
+-
+-        // Garante contexto no master, independentemente do que estiver na connection string.
+-        var builder = new SqlConnectionStringBuilder(raw) { InitialCatalog = "master" };
+-        if (string.IsNullOrWhiteSpace(builder.ApplicationName) ||
+-            builder.ApplicationName == "Core Microsoft SqlClient Data Provider")
+-            builder.ApplicationName = "SqlRestoreManager";
+-
+-        _connectionString = builder.ConnectionString;
++        _connections = connections;
++        _catalog = catalog;
+         _options = options.Value;
+-        _whitelist = whitelist;
+         _logger = logger;
+     }
+ 
+@@ -47,8 +38,8 @@ public sealed class SqlRestoreService
+     public async Task<IReadOnlyList<SqlSessionInfo>> GetSessionsAsync(
+         string database, CancellationToken ct = default)
+     {
+-        var db = _whitelist.Resolve(database);
+-        await using var cn = await OpenAsync(ct);
++        var db = await _catalog.ResolveAsync(database, ct);
++        await using var cn = await _connections.OpenMasterAsync(ct);
+         return await QuerySessionsAsync(cn, db, ct);
+     }
+ 
+@@ -126,7 +117,7 @@ public sealed class SqlRestoreService
+     public async Task<BackupInspection> InspectBackupAsync(
+         string sqlServerBackupPath, CancellationToken ct = default)
+     {
+-        await using var cn = await OpenAsync(ct);
++        await using var cn = await _connections.OpenMasterAsync(ct);
+         var serverMajor = await GetServerMajorVersionAsync(cn, ct);
+ 
+         var sets = new List<(int Position, int Type, string Database, DateTime? Finish, string? Server, int Major)>();
+@@ -200,9 +191,10 @@ public sealed class SqlRestoreService
+         Action<int> onSessionStarted,
+         CancellationToken ct = default)
+     {
+-        var db = _whitelist.Resolve(request.TargetDatabase);
++        // Revalida no momento do restore (o banco pode ter sido bloqueado/removido após o upload).
++        var db = await _catalog.ResolveAsync(request.TargetDatabase, ct);
+ 
+-        await using var cn = await OpenAsync(ct);
++        await using var cn = await _connections.OpenMasterAsync(ct);
+         onSessionStarted(await GetSessionIdAsync(cn, ct));
+ 
+         // Lock entre instâncias (dev + IIS) — liberado ao fechar a conexão.
+@@ -248,7 +240,7 @@ public sealed class SqlRestoreService
+ 
+     public async Task<double?> GetRestorePercentAsync(int sessionId, CancellationToken ct = default)
+     {
+-        await using var cn = await OpenAsync(ct);
++        await using var cn = await _connections.OpenMasterAsync(ct);
+         await using var cmd = CreateCommand(cn, """
+             SELECT TOP (1) CAST(r.percent_complete AS float)
+             FROM sys.dm_exec_requests AS r
+@@ -434,21 +426,6 @@ public sealed class SqlRestoreService
+         return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+     }
+ 
+-    private async Task<SqlConnection> OpenAsync(CancellationToken ct)
+-    {
+-        var cn = new SqlConnection(_connectionString);
+-        try
+-        {
+-            await cn.OpenAsync(ct);
+-            return cn;
+-        }
+-        catch
+-        {
+-            await cn.DisposeAsync();
+-            throw;
+-        }
+-    }
+-
+     private static SqlCommand CreateCommand(SqlConnection cn, string sql, int timeoutSeconds)
+     {
+         var cmd = cn.CreateCommand();
+@@ -469,7 +446,7 @@ public sealed class SqlRestoreService
+     private static void AddPathParameter(SqlCommand cmd, string name, string path) =>
+         cmd.Parameters.Add(name, SqlDbType.NVarChar, 1024).Value = path;
+ 
+-    /// <summary>Nome já validado pela whitelist/regex; o escape é defesa adicional.</summary>
++    /// <summary>Nome já validado pelo DatabaseCatalog; o escape é defesa adicional.</summary>
+     private static string QuoteName(string value) => "[" + value.Replace("]", "]]") + "]";
+ 
+     private static string CombineServerPath(string directory, string name) =>
+diff --git a/Views/Restore/Index.cshtml b/Views/Restore/Index.cshtml
+index d6ed538..aabb924 100644
+--- a/Views/Restore/Index.cshtml
++++ b/Views/Restore/Index.cshtml
+@@ -1,7 +1,7 @@
++@model RestoreIndexViewModel
+ @{
+     ViewData["Title"] = "Restaurar";
+-    var databases = (IEnumerable<string>)ViewBag.Databases;
+-    var maxUploadMb = (int)ViewBag.MaxUploadMB;
++    var maxUploadMb = Model.MaxUploadMB;
+ }
+ <section class="card">
+     <h1>Restaurar banco SQL Server</h1>
+@@ -14,11 +14,26 @@
+         <label for="targetDatabase">Banco de destino</label>
+         <select id="targetDatabase" name="targetDatabase" required>
+             <option value="">Selecione...</option>
+-            @foreach (var db in databases)
++            @foreach (var db in Model.Databases)
+             {
+-                <option value="@db">@db</option>
++                if (db.CanRestore)
++                {
++                    <option value="@db.Name">@db.Label</option>
++                }
++                else
++                {
++                    <option value="@db.Name" disabled>@db.Label</option>
++                }
+             }
+         </select>
++        @if (Model.LoadError is not null)
++        {
++            <div class="error">Não foi possível listar os bancos do servidor. @Model.LoadError</div>
++        }
++        else if (!Model.Databases.Any(d => d.CanRestore))
++        {
++            <div class="warning">Nenhum banco disponível para restore neste servidor.</div>
++        }
+ 
+         <div id="sessions" class="warning hidden"></div>
+ 
+-- 
+2.43.0
+

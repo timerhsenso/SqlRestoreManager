@@ -1,0 +1,278 @@
+@model RestoreIndexViewModel
+@{
+    ViewData["Title"] = "Restaurar";
+    var maxUploadMb = Model.MaxUploadMB;
+}
+<section class="card">
+    <h1>Restaurar banco SQL Server</h1>
+    <p>Envie um backup <b>.bak</b> ou um <b>.zip</b> com exatamente um .bak (máximo @maxUploadMb MB).</p>
+
+    <form id="restoreForm" novalidate>
+        <label for="file">Arquivo</label>
+        <input id="file" name="file" type="file" accept=".bak,.zip" required />
+
+        <label for="targetDatabase">Banco de destino</label>
+        <select id="targetDatabase" name="targetDatabase" required>
+            <option value="">Selecione...</option>
+            @foreach (var db in Model.Databases)
+            {
+                if (db.CanRestore)
+                {
+                    <option value="@db.Name">@db.Label</option>
+                }
+                else
+                {
+                    <option value="@db.Name" disabled>@db.Label</option>
+                }
+            }
+        </select>
+        @if (Model.LoadError is not null)
+        {
+            <div class="error">Não foi possível listar os bancos do servidor. @Model.LoadError</div>
+        }
+        else if (!Model.Databases.Any(d => d.CanRestore))
+        {
+            <div class="warning">Nenhum banco disponível para restore neste servidor.</div>
+        }
+
+        <div id="sessions" class="warning hidden"></div>
+
+        <label class="confirm">
+            <input type="checkbox" id="confirmReplace" />
+            Confirmo que o banco selecionado será completamente substituído.
+        </label>
+
+        <button type="submit" id="btnSubmit">Restaurar banco</button>
+    </form>
+
+    <div id="progressBox" class="hidden">
+        <div class="progress-label">Envio do arquivo</div>
+        <div class="progress"><div id="uploadBar"></div></div>
+        <div id="uploadText" class="progress-text"></div>
+
+        <div class="progress-label">Restore</div>
+        <div class="progress"><div id="restoreBar"></div></div>
+        <div id="restoreText" class="progress-text">Aguardando envio...</div>
+    </div>
+
+    <div id="error" class="error hidden" role="alert"></div>
+    <div id="success" class="success hidden" role="status"></div>
+</section>
+
+@section Scripts {
+<script src="https://cdn.jsdelivr.net/npm/@@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+<script>
+(() => {
+    "use strict";
+
+    const urls = {
+        sessions: "@Url.Action("Sessions", "Restore")",
+        status: "@Url.Action("Status", "Restore")",
+        start: "@Url.Action("Start", "Restore")",
+        hub: "@Url.Content("~/restoreHub")"
+    };
+    const maxBytes = @maxUploadMb * 1024 * 1024;
+    const terminalFailures = ["Error", "Interrupted"];
+
+    const $ = id => document.getElementById(id);
+    const form = $("restoreForm");
+    const fileInput = $("file");
+    const dbSelect = $("targetDatabase");
+    const sessionsBox = $("sessions");
+    const submitButton = $("btnSubmit");
+    const errorBox = $("error");
+    const successBox = $("success");
+
+    let currentJobId = null;
+    let finished = true;
+
+    // Sempre textContent/DOM: nada vindo do servidor vira HTML (corrige XSS).
+    const show = (node, text) => { node.textContent = text; node.classList.remove("hidden"); };
+    const hide = node => { node.textContent = ""; node.classList.add("hidden"); };
+    const setBar = (id, pct) => { $(id).style.width = `${Math.max(0, Math.min(100, pct))}%`; };
+    const mb = bytes => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+
+    function finish(ok, message) {
+        finished = true;
+        submitButton.disabled = false;
+        if (ok) {
+            setBar("restoreBar", 100);
+            $("restoreText").textContent = "Concluído.";
+            show(successBox, message);
+        } else {
+            show(errorBox, message || "Falha no restore.");
+        }
+    }
+
+    // ------------------------------------------------------------ Sessões
+    async function loadSessions() {
+        hide(sessionsBox);
+        if (!dbSelect.value) return;
+
+        try {
+            const response = await fetch(`${urls.sessions}?database=${encodeURIComponent(dbSelect.value)}`);
+            if (!response.ok) return;
+
+            const sessions = await response.json();
+            if (!sessions.length) return;
+
+            const title = document.createElement("div");
+            const strong = document.createElement("b");
+            strong.textContent = "Atenção: ";
+            title.append(strong,
+                `${sessions.length} conexão(ões) ativa(s). Elas serão encerradas (ROLLBACK IMMEDIATE) antes do restore.`);
+
+            const list = document.createElement("ul");
+            for (const s of sessions) {
+                const item = document.createElement("li");
+                item.textContent = `#${s.sessionId} · ${s.host || "?"} · ${s.login || "?"} · ${s.program || "?"}`;
+                list.appendChild(item);
+            }
+
+            sessionsBox.replaceChildren(title, list);
+            sessionsBox.classList.remove("hidden");
+        } catch {
+            // Informativo: falha aqui não bloqueia o restore.
+        }
+    }
+
+    // ------------------------------------------------------------ SignalR
+    const connection = new signalR.HubConnectionBuilder()
+        .withUrl(urls.hub)
+        .withAutomaticReconnect()
+        .build();
+
+    connection.on("RestoreProgress", m => {
+        if (m.jobId !== currentJobId || finished) return;
+        setBar("restoreBar", m.percent);
+        $("restoreText").textContent = m.message;
+    });
+
+    connection.on("RestoreCompleted", m => {
+        if (m.jobId !== currentJobId || finished) return;
+        finish(true, m.message);
+    });
+
+    connection.on("RestoreFailed", m => {
+        if (m.jobId !== currentJobId || finished) return;
+        finish(false, m.message);
+    });
+
+    connection.onreconnected(async () => {
+        if (currentJobId && !finished) {
+            await joinJob();
+            await refreshStatus();
+        }
+    });
+
+    const connectionStarted = connection.start()
+        .catch(err => console.error("SignalR indisponível; usando consulta de status.", err));
+
+    async function joinJob() {
+        if (connection.state !== signalR.HubConnectionState.Connected) return;
+        try { await connection.invoke("JoinJob", currentJobId); }
+        catch (err) { console.error(err); }
+    }
+
+    // Garante estado correto se eventos chegaram antes do JoinJob ou após reconexão.
+    async function refreshStatus() {
+        if (!currentJobId || finished) return;
+        try {
+            const response = await fetch(`${urls.status}?jobId=${encodeURIComponent(currentJobId)}`);
+            if (!response.ok) return;
+            const s = await response.json();
+            if (finished) return;
+
+            setBar("restoreBar", s.percentComplete);
+            $("restoreText").textContent = s.currentStep || s.status;
+
+            if (s.status === "Success") finish(true, "Restore concluído com sucesso.");
+            else if (terminalFailures.includes(s.status)) finish(false, s.errorMessage);
+        } catch (err) {
+            console.error(err);
+        }
+    }
+
+    // Rede de segurança caso o SignalR esteja indisponível.
+    setInterval(() => {
+        if (currentJobId && !finished && connection.state !== signalR.HubConnectionState.Connected)
+            refreshStatus();
+    }, 5000);
+
+    // ------------------------------------------------------------- Upload
+    function upload(url, formData) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", url);
+
+            xhr.upload.onprogress = e => {
+                if (!e.lengthComputable) return;
+                const pct = e.loaded / e.total * 100;
+                setBar("uploadBar", pct);
+                $("uploadText").textContent = `${mb(e.loaded)} de ${mb(e.total)} (${pct.toFixed(0)}%)`;
+            };
+
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try { resolve(JSON.parse(xhr.responseText)); }
+                    catch { reject(new Error("Resposta inválida do servidor.")); }
+                    return;
+                }
+
+                const body = (xhr.responseText || "").trim();
+                const isHtml = body.startsWith("<");
+                if (xhr.status === 404 && isHtml)
+                    reject(new Error("O servidor recusou o arquivo (limite de tamanho do IIS)."));
+                else
+                    reject(new Error(!body || isHtml ? `Falha no envio (HTTP ${xhr.status}).` : body));
+            };
+
+            xhr.onerror = () => reject(new Error("Falha de rede durante o envio do arquivo."));
+            xhr.send(formData);
+        });
+    }
+
+    form.addEventListener("submit", async e => {
+        e.preventDefault();
+        hide(errorBox);
+        hide(successBox);
+
+        const file = fileInput.files[0];
+        if (!file) return show(errorBox, "Selecione um arquivo.");
+        if (!/\.(bak|zip)$/i.test(file.name)) return show(errorBox, "Somente arquivos .bak ou .zip.");
+        if (file.size > maxBytes) return show(errorBox, `O arquivo tem ${mb(file.size)} e excede o limite de @maxUploadMb MB.`);
+        if (!dbSelect.value) return show(errorBox, "Selecione o banco de destino.");
+        if (!$("confirmReplace").checked) return show(errorBox, "Confirme que o banco será substituído.");
+        if (!confirm(`ATENÇÃO: o banco ${dbSelect.value} será totalmente substituído. Continuar?`)) return;
+
+        submitButton.disabled = true;
+        finished = false;
+        currentJobId = null;
+        setBar("uploadBar", 0);
+        setBar("restoreBar", 0);
+        $("uploadText").textContent = "";
+        $("restoreText").textContent = "Aguardando envio...";
+        $("progressBox").classList.remove("hidden");
+
+        const data = new FormData();
+        data.append("file", file, file.name);
+
+        try {
+            await connectionStarted;
+            const result = await upload(`${urls.start}?targetDatabase=${encodeURIComponent(dbSelect.value)}`, data);
+
+            currentJobId = result.jobId;
+            $("uploadText").textContent = `Envio concluído (${mb(file.size)}).`;
+            $("restoreText").textContent = "Na fila de restore...";
+
+            await joinJob();
+            await refreshStatus();
+        } catch (err) {
+            finish(false, err.message);
+        }
+    });
+
+    dbSelect.addEventListener("change", loadSessions);
+})();
+</script>
+}
