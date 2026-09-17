@@ -51,6 +51,30 @@ public sealed class RestoreOptions
     /// </summary>
     public bool ShowBlockedDatabases { get; set; } = true;
 
+    /// <summary>
+    /// Permite restaurar criando um banco que ainda não existe (nome digitado na tela).
+    /// O nome continua sujeito a BlockedDatabases e às regras de nome.
+    /// </summary>
+    public bool AllowNewDatabases { get; set; } = true;
+
+    /// <summary>
+    /// Pasta (vista pela aplicação) onde os backups são copiados manualmente, para restaurar
+    /// sem upload. Vazio = recurso desligado.
+    /// </summary>
+    public string? LibraryPath { get; set; }
+
+    /// <summary>Mesma pasta de <see cref="LibraryPath"/>, como o SQL Server a enxerga.</summary>
+    public string? SqlServerLibraryPath { get; set; }
+
+    /// <summary>Caminho do 7z.exe no servidor da aplicação. Habilita .rar e .7z.</summary>
+    public string? SevenZipPath { get; set; }
+
+    /// <summary>Verificações antes de sobrescrever o banco.</summary>
+    public PreRestoreOptions PreRestore { get; set; } = new();
+
+    /// <summary>Ajustes automáticos após o restore.</summary>
+    public PostRestoreOptions PostRestore { get; set; } = new();
+
     public string EffectiveNodeName =>
         string.IsNullOrWhiteSpace(NodeName) ? Environment.MachineName : NodeName.Trim();
 

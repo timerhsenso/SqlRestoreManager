@@ -5,62 +5,113 @@
 }
 <section class="card">
     <h1>Restaurar banco SQL Server</h1>
-    <p>Envie um backup <b>.bak</b> ou um <b>.zip</b> com exatamente um .bak (máximo @maxUploadMb MB).</p>
+    <p class="card-lead">
+        Formatos aceitos: @string.Join(", ", Model.AllowedExtensions). Arquivos compactados devem conter
+        exatamente um .bak. Envio pelo navegador: até @maxUploadMb MB.
+    </p>
 
     <form id="restoreForm" novalidate>
-        <label for="file">Arquivo</label>
-        <input id="file" name="file" type="file" accept=".bak,.zip" required />
+        @if (Model.LibraryEnabled)
+        {
+            <div class="field">
+                <span class="label">Origem do backup</span>
+                <div class="choice">
+                    <label><input type="radio" name="origin" value="upload" checked /> Enviar do meu computador</label>
+                    <label><input type="radio" name="origin" value="library" /> Usar arquivo da pasta do servidor</label>
+                </div>
+            </div>
+        }
 
-        <label for="targetDatabase">Banco de destino</label>
-        <select id="targetDatabase" name="targetDatabase" required>
-            <option value="">Selecione...</option>
-            @foreach (var db in Model.Databases)
+        <div class="field" id="uploadSource">
+            <label class="label" for="file">Arquivo</label>
+            <input id="file" type="file" accept="@string.Join(",", Model.AllowedExtensions)" />
+        </div>
+
+        @if (Model.LibraryEnabled)
+        {
+            <div class="field hidden" id="librarySource">
+                <label class="label" for="libraryFile">Arquivo na pasta do servidor</label>
+                <select id="libraryFile">
+                    <option value="">Carregando...</option>
+                </select>
+                <div class="actions">
+                    <button type="button" id="btnReloadFiles" class="btn-ghost btn-small">Atualizar lista</button>
+                </div>
+            </div>
+        }
+
+        <div class="field">
+            <label class="label" for="targetDatabase">Banco de destino</label>
+            @if (Model.AllowNewDatabases)
             {
-                if (db.CanRestore)
-                {
-                    <option value="@db.Name">@db.Label</option>
-                }
-                else
-                {
-                    <option value="@db.Name" disabled>@db.Label</option>
-                }
+                <label class="check" style="margin-top:0;margin-bottom:10px">
+                    <input type="checkbox" id="createNew" /> Criar um banco novo com o nome que eu digitar
+                </label>
             }
-        </select>
-        @if (Model.LoadError is not null)
-        {
-            <div class="error">Não foi possível listar os bancos do servidor. @Model.LoadError</div>
-        }
-        else if (!Model.Databases.Any(d => d.CanRestore))
-        {
-            <div class="warning">Nenhum banco disponível para restore neste servidor.</div>
-        }
+            <select id="targetDatabase">
+                <option value="">Selecione...</option>
+                @foreach (var db in Model.Databases)
+                {
+                    if (db.CanRestore)
+                    {
+                        <option value="@db.Name">@db.Label</option>
+                    }
+                    else
+                    {
+                        <option value="@db.Name" disabled>@db.Label</option>
+                    }
+                }
+            </select>
+            @if (Model.AllowNewDatabases)
+            {
+                <input id="newDatabase" class="hidden" type="text" maxlength="128"
+                       placeholder="Nome do novo banco (letras, números, _ , - e .)" />
+            }
 
-        <div id="sessions" class="warning hidden"></div>
+            @if (Model.LoadError is not null)
+            {
+                <div class="alert alert-error">Não foi possível listar os bancos do servidor. @Model.LoadError</div>
+            }
+            else if (!Model.Databases.Any(d => d.CanRestore))
+            {
+                <div class="alert alert-warn">Nenhum banco disponível para restore neste servidor.</div>
+            }
+        </div>
 
-        <label class="confirm">
+        <div id="sessions" class="alert alert-warn hidden"></div>
+
+        <label class="check">
             <input type="checkbox" id="confirmReplace" />
-            Confirmo que o banco selecionado será completamente substituído.
+            <span id="confirmLabel">Confirmo que o banco selecionado será completamente substituído.</span>
         </label>
 
-        <button type="submit" id="btnSubmit">Restaurar banco</button>
+        <div class="actions">
+            <button type="submit" id="btnSubmit">Restaurar banco</button>
+        </div>
     </form>
 
-    <div id="progressBox" class="hidden">
-        <div class="progress-label">Envio do arquivo</div>
-        <div class="progress"><div id="uploadBar"></div></div>
-        <div id="uploadText" class="progress-text"></div>
-
-        <div class="progress-label">Restore</div>
-        <div class="progress"><div id="restoreBar"></div></div>
-        <div id="restoreText" class="progress-text">Aguardando envio...</div>
+    <div id="console" class="console hidden">
+        <div class="console-row">
+            <div class="console-head"><b>Envio do arquivo</b><span class="console-value" id="uploadValue">0%</span></div>
+            <div class="track" id="uploadTrack"><div id="uploadBar"></div></div>
+            <div class="console-note" id="uploadText">Aguardando envio do arquivo...</div>
+        </div>
+        <div class="console-row">
+            <div class="console-head"><b>Restore</b><span class="console-value" id="restoreValue">0%</span></div>
+            <div class="track" id="restoreTrack"><div id="restoreBar"></div></div>
+            <div class="console-note" id="restoreText">Na fila...</div>
+        </div>
+        <div class="actions">
+            <button type="button" id="btnCancel" class="btn-danger btn-small">Cancelar restore</button>
+        </div>
     </div>
 
-    <div id="error" class="error hidden" role="alert"></div>
-    <div id="success" class="success hidden" role="status"></div>
+    <div id="error" class="alert alert-error hidden" role="alert"></div>
+    <div id="success" class="alert alert-ok hidden" role="status"></div>
 </section>
 
 @section Scripts {
-<script src="https://cdn.jsdelivr.net/npm/@@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+<script src="~/lib/signalr/signalr.min.js" asp-append-version="true"></script>
 <script>
 (() => {
     "use strict";
@@ -69,45 +120,130 @@
         sessions: "@Url.Action("Sessions", "Restore")",
         status: "@Url.Action("Status", "Restore")",
         start: "@Url.Action("Start", "Restore")",
+        startFromFile: "@Url.Action("StartFromFile", "Restore")",
+        files: "@Url.Action("Files", "Restore")",
+        cancel: "@Url.Action("Cancel", "Restore")",
         hub: "@Url.Content("~/restoreHub")"
     };
     const maxBytes = @maxUploadMb * 1024 * 1024;
-    const terminalFailures = ["Error", "Interrupted"];
+    const libraryEnabled = @(Model.LibraryEnabled ? "true" : "false");
+    const allowNewDatabases = @(Model.AllowNewDatabases ? "true" : "false");
+    const allowedExtensions = @Html.Raw(Json.Serialize(Model.AllowedExtensions));
+    const databaseNameRegex = /^[\p{L}\p{N}_\-. ]{1,128}$/u;
+    const terminalFailures = ["Error", "Interrupted", "Canceled"];
 
     const $ = id => document.getElementById(id);
     const form = $("restoreForm");
     const fileInput = $("file");
     const dbSelect = $("targetDatabase");
+    const librarySelect = $("libraryFile");
+    const createNewCheck = $("createNew");
+    const newDatabaseInput = $("newDatabase");
     const sessionsBox = $("sessions");
     const submitButton = $("btnSubmit");
+    const cancelButton = $("btnCancel");
     const errorBox = $("error");
     const successBox = $("success");
 
     let currentJobId = null;
     let finished = true;
 
-    // Sempre textContent/DOM: nada vindo do servidor vira HTML (corrige XSS).
+    // Sempre textContent/DOM: nada vindo do servidor vira HTML.
     const show = (node, text) => { node.textContent = text; node.classList.remove("hidden"); };
     const hide = node => { node.textContent = ""; node.classList.add("hidden"); };
-    const setBar = (id, pct) => { $(id).style.width = `${Math.max(0, Math.min(100, pct))}%`; };
     const mb = bytes => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
-    function finish(ok, message) {
+    function setProgress(name, percent, running) {
+        const value = Math.max(0, Math.min(100, percent));
+        $(`${name}Bar`).style.width = `${value}%`;
+        $(`${name}Value`).textContent = `${value.toFixed(0)}%`;
+        $(`${name}Track`).classList.toggle("running", running === true && value < 100);
+    }
+
+    function fail(message) {
         finished = true;
         submitButton.disabled = false;
-        if (ok) {
-            setBar("restoreBar", 100);
-            $("restoreText").textContent = "Concluído.";
-            show(successBox, message);
-        } else {
-            show(errorBox, message || "Falha no restore.");
+        cancelButton.disabled = true;
+        setProgress("restore", 0, false);
+        show(errorBox, message || "Falha no restore.");
+        ui.toast(message || "Falha no restore.", { type: "error", timeout: 0 });
+    }
+
+    function succeed(message, hasWarnings) {
+        finished = true;
+        submitButton.disabled = false;
+        cancelButton.disabled = true;
+        setProgress("restore", 100, false);
+        $("restoreText").textContent = hasWarnings ? "Concluído com alertas." : "Concluído.";
+        show(successBox, message);
+        ui.toast(message, { type: hasWarnings ? "warn" : "ok", timeout: hasWarnings ? 0 : 9000 });
+    }
+
+    // ------------------------------------------- Destino (existente x novo)
+    const creatingNew = () => allowNewDatabases && createNewCheck.checked;
+    const targetDatabase = () => creatingNew() ? newDatabaseInput.value.trim() : dbSelect.value;
+
+    function applyTarget() {
+        const isNew = creatingNew();
+        dbSelect.classList.toggle("hidden", isNew);
+        newDatabaseInput.classList.toggle("hidden", !isNew);
+        $("confirmLabel").textContent = isNew
+            ? "Confirmo a criação de um banco novo com este nome."
+            : "Confirmo que o banco selecionado será completamente substituído.";
+        hide(sessionsBox);
+        if (!isNew) loadSessions();
+    }
+
+    if (allowNewDatabases) createNewCheck.addEventListener("change", applyTarget);
+
+    // ------------------------------------------- Origem (upload x pasta)
+    const currentOrigin = () =>
+        libraryEnabled ? document.querySelector('input[name="origin"]:checked').value : "upload";
+
+    function applyOrigin() {
+        const library = currentOrigin() === "library";
+        $("uploadSource").classList.toggle("hidden", library);
+        $("librarySource").classList.toggle("hidden", !library);
+        if (library && librarySelect.dataset.loaded !== "1") loadFiles();
+    }
+
+    async function loadFiles() {
+        librarySelect.replaceChildren(new Option("Carregando...", ""));
+        try {
+            const response = await fetch(urls.files);
+            if (!response.ok) {
+                librarySelect.replaceChildren(new Option("Selecione...", ""));
+                ui.toast(await response.text(), { type: "error" });
+                return;
+            }
+
+            const files = await response.json();
+            if (!files.length) {
+                librarySelect.replaceChildren(new Option("Nenhum arquivo na pasta", ""));
+                return;
+            }
+
+            const options = [new Option("Selecione...", "")];
+            for (const f of files)
+                options.push(new Option(`${f.name} — ${f.sizeMB.toLocaleString("pt-BR")} MB — ${f.modifiedAt}`, f.name));
+
+            librarySelect.replaceChildren(...options);
+            librarySelect.dataset.loaded = "1";
+        } catch (err) {
+            ui.toast(err.message, { type: "error" });
         }
+    }
+
+    if (libraryEnabled) {
+        for (const radio of document.querySelectorAll('input[name="origin"]'))
+            radio.addEventListener("change", applyOrigin);
+        $("btnReloadFiles").addEventListener("click", loadFiles);
     }
 
     // ------------------------------------------------------------ Sessões
     async function loadSessions() {
         hide(sessionsBox);
-        if (!dbSelect.value) return;
+        if (creatingNew() || !dbSelect.value) return;
 
         try {
             const response = await fetch(`${urls.sessions}?database=${encodeURIComponent(dbSelect.value)}`);
@@ -118,9 +254,8 @@
 
             const title = document.createElement("div");
             const strong = document.createElement("b");
-            strong.textContent = "Atenção: ";
-            title.append(strong,
-                `${sessions.length} conexão(ões) ativa(s). Elas serão encerradas (ROLLBACK IMMEDIATE) antes do restore.`);
+            strong.textContent = `${sessions.length} conexão(ões) ativa(s). `;
+            title.append(strong, "Elas serão encerradas (ROLLBACK IMMEDIATE) antes do restore.");
 
             const list = document.createElement("ul");
             for (const s of sessions) {
@@ -144,18 +279,18 @@
 
     connection.on("RestoreProgress", m => {
         if (m.jobId !== currentJobId || finished) return;
-        setBar("restoreBar", m.percent);
+        setProgress("restore", m.percent, true);
         $("restoreText").textContent = m.message;
     });
 
     connection.on("RestoreCompleted", m => {
         if (m.jobId !== currentJobId || finished) return;
-        finish(true, m.message);
+        succeed(m.message, m.hasWarnings);
     });
 
     connection.on("RestoreFailed", m => {
         if (m.jobId !== currentJobId || finished) return;
-        finish(false, m.message);
+        fail(m.message);
     });
 
     connection.onreconnected(async () => {
@@ -174,20 +309,22 @@
         catch (err) { console.error(err); }
     }
 
-    // Garante estado correto se eventos chegaram antes do JoinJob ou após reconexão.
+    // Garante o estado correto se eventos chegaram antes do JoinJob ou após reconexão.
     async function refreshStatus() {
         if (!currentJobId || finished) return;
         try {
             const response = await fetch(`${urls.status}?jobId=${encodeURIComponent(currentJobId)}`);
             if (!response.ok) return;
+
             const s = await response.json();
             if (finished) return;
 
-            setBar("restoreBar", s.percentComplete);
+            setProgress("restore", s.percentComplete, true);
             $("restoreText").textContent = s.currentStep || s.status;
 
-            if (s.status === "Success") finish(true, "Restore concluído com sucesso.");
-            else if (terminalFailures.includes(s.status)) finish(false, s.errorMessage);
+            if (s.status === "Success") succeed("Restore concluído com sucesso.", false);
+            else if (s.status === "Warning") succeed(`Restore concluído com alertas.\n${s.postRestoreLog || ""}`, true);
+            else if (terminalFailures.includes(s.status)) fail(s.errorMessage);
         } catch (err) {
             console.error(err);
         }
@@ -207,9 +344,15 @@
 
             xhr.upload.onprogress = e => {
                 if (!e.lengthComputable) return;
-                const pct = e.loaded / e.total * 100;
-                setBar("uploadBar", pct);
-                $("uploadText").textContent = `${mb(e.loaded)} de ${mb(e.total)} (${pct.toFixed(0)}%)`;
+                setProgress("upload", e.loaded / e.total * 100, true);
+                $("uploadText").textContent = `${mb(e.loaded)} de ${mb(e.total)} enviados.`;
+            };
+
+            // Todos os bytes saíram do navegador; o servidor ainda está gravando o arquivo.
+            xhr.upload.onload = () => {
+                setProgress("upload", 100, false);
+                $("uploadText").textContent = "Arquivo enviado. Aguardando o servidor gravar...";
+                $("restoreText").textContent = "Aguardando o servidor...";
             };
 
             xhr.onload = () => {
@@ -237,42 +380,109 @@
         hide(errorBox);
         hide(successBox);
 
+        const fromLibrary = currentOrigin() === "library";
         const file = fileInput.files[0];
-        if (!file) return show(errorBox, "Selecione um arquivo.");
-        if (!/\.(bak|zip)$/i.test(file.name)) return show(errorBox, "Somente arquivos .bak ou .zip.");
-        if (file.size > maxBytes) return show(errorBox, `O arquivo tem ${mb(file.size)} e excede o limite de @maxUploadMb MB.`);
-        if (!dbSelect.value) return show(errorBox, "Selecione o banco de destino.");
-        if (!$("confirmReplace").checked) return show(errorBox, "Confirme que o banco será substituído.");
-        if (!confirm(`ATENÇÃO: o banco ${dbSelect.value} será totalmente substituído. Continuar?`)) return;
+        const database = targetDatabase();
+        const isNew = creatingNew();
+
+        if (fromLibrary) {
+            if (!librarySelect.value) return show(errorBox, "Selecione um arquivo da pasta do servidor.");
+        } else {
+            if (!file) return show(errorBox, "Selecione um arquivo.");
+            if (!allowedExtensions.some(ext => file.name.toLowerCase().endsWith(ext)))
+                return show(errorBox, `Formatos aceitos: ${allowedExtensions.join(", ")}.`);
+            if (file.size > maxBytes)
+                return show(errorBox, `O arquivo tem ${mb(file.size)} e excede o limite de @maxUploadMb MB.`);
+        }
+
+        if (!database)
+            return show(errorBox, isNew ? "Informe o nome do novo banco." : "Selecione o banco de destino.");
+        if (isNew && !databaseNameRegex.test(database))
+            return show(errorBox, "Nome inválido. Use apenas letras, números, espaço, '_', '-' ou '.'.");
+        if (!$("confirmReplace").checked)
+            return show(errorBox, isNew ? "Confirme a criação do banco." : "Confirme que o banco será substituído.");
+
+        const confirmed = await ui.confirm(isNew
+            ? {
+                title: "Criar banco novo",
+                message: `O banco ${database} será criado neste servidor a partir do backup selecionado.`,
+                confirmText: "Criar e restaurar"
+            }
+            : {
+                title: `Substituir ${database}?`,
+                message: "Todo o conteúdo atual do banco será perdido e as conexões ativas serão encerradas.",
+                confirmText: "Substituir banco",
+                danger: true
+            });
+
+        if (!confirmed) return;
 
         submitButton.disabled = true;
+        cancelButton.disabled = false;
         finished = false;
         currentJobId = null;
-        setBar("uploadBar", 0);
-        setBar("restoreBar", 0);
-        $("uploadText").textContent = "";
-        $("restoreText").textContent = "Aguardando envio...";
-        $("progressBox").classList.remove("hidden");
-
-        const data = new FormData();
-        data.append("file", file, file.name);
+        setProgress("upload", fromLibrary ? 100 : 0, !fromLibrary);
+        setProgress("restore", 0, true);
+        $("uploadText").textContent = fromLibrary ? "Arquivo já está no servidor." : "Aguardando envio do arquivo...";
+        $("restoreText").textContent = fromLibrary ? "Enviando para a fila..." : "Na fila...";
+        $("console").classList.remove("hidden");
 
         try {
             await connectionStarted;
-            const result = await upload(`${urls.start}?targetDatabase=${encodeURIComponent(dbSelect.value)}`, data);
+
+            let result;
+            if (fromLibrary) {
+                const url = `${urls.startFromFile}?targetDatabase=${encodeURIComponent(database)}`
+                          + `&createNew=${isNew}&fileName=${encodeURIComponent(librarySelect.value)}`;
+                const response = await fetch(url, { method: "POST" });
+                if (!response.ok) throw new Error(await response.text() || `Falha (HTTP ${response.status}).`);
+                result = await response.json();
+            } else {
+                const data = new FormData();
+                data.append("file", file, file.name);
+                result = await upload(
+                    `${urls.start}?targetDatabase=${encodeURIComponent(database)}&createNew=${isNew}`, data);
+                $("uploadText").textContent = `Envio concluído (${mb(file.size)}).`;
+            }
 
             currentJobId = result.jobId;
-            $("uploadText").textContent = `Envio concluído (${mb(file.size)}).`;
             $("restoreText").textContent = "Na fila de restore...";
 
             await joinJob();
             await refreshStatus();
         } catch (err) {
-            finish(false, err.message);
+            fail(err.message);
+        }
+    });
+
+    cancelButton.addEventListener("click", async () => {
+        if (!currentJobId || finished) return;
+
+        const confirmed = await ui.confirm({
+            title: "Cancelar restore?",
+            message: "Se a gravação já tiver começado, o banco de destino ficará em estado RESTORING "
+                   + "e precisará de um novo restore para voltar a funcionar.",
+            confirmText: "Cancelar restore",
+            cancelText: "Continuar restaurando",
+            danger: true
+        });
+        if (!confirmed) return;
+
+        cancelButton.disabled = true;
+        try {
+            const response = await fetch(`${urls.cancel}?jobId=${encodeURIComponent(currentJobId)}`, { method: "POST" });
+            const text = await response.text();
+            ui.toast(text, { type: response.ok ? "warn" : "error" });
+            if (!response.ok) cancelButton.disabled = false;
+        } catch (err) {
+            ui.toast(err.message, { type: "error" });
+            cancelButton.disabled = false;
         }
     });
 
     dbSelect.addEventListener("change", loadSessions);
+    if (allowNewDatabases) applyTarget();
+    if (libraryEnabled) applyOrigin();
 })();
 </script>
 }

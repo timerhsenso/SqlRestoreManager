@@ -92,10 +92,16 @@ public sealed class RestoreMaintenanceService : BackgroundService
 
             foreach (var item in stale)
             {
-                item.ErrorMessage = item.Status == RestoreStatus.Restoring
-                    ? "A aplicação foi reiniciada durante o restore. O banco de destino pode ter ficado em " +
-                      "estado RESTORING; execute um novo restore."
-                    : "A aplicação foi reiniciada antes da execução do restore. Envie o arquivo novamente.";
+                item.ErrorMessage = item.Status switch
+                {
+                    RestoreStatus.Restoring =>
+                        "A aplicação foi reiniciada durante o restore. O banco de destino pode ter ficado em " +
+                        "estado RESTORING; execute um novo restore.",
+                    RestoreStatus.PostRestoring =>
+                        "A aplicação foi reiniciada durante o pós-restore. O banco foi restaurado, mas os " +
+                        "ajustes (recovery, log, usuários, scripts) podem não ter sido concluídos.",
+                    _ => "A aplicação foi reiniciada antes da execução do restore. Envie o arquivo novamente."
+                };
                 item.Status = RestoreStatus.Interrupted;
                 item.CurrentStep = RestoreStatus.ToLabel(RestoreStatus.Interrupted);
                 item.FinishedAt = DateTime.Now;

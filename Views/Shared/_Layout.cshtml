@@ -1,3 +1,6 @@
+@{
+    var action = (ViewContext.RouteData.Values["controller"] as string) ?? "Restore";
+}
 <!doctype html>
 <html lang="pt-br">
 <head>
@@ -7,14 +10,15 @@
     <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
 </head>
 <body>
-<header>
-    <strong>SQL Restore Manager</strong>
+<header class="topbar">
+    <span class="brand">SQL Restore Manager</span>
     <nav>
-        <a asp-controller="Restore" asp-action="Index">Restaurar</a>
-        <a asp-controller="History" asp-action="Index">Histórico</a>
+        <a asp-controller="Restore" asp-action="Index" aria-current="@(action == "Restore" ? "page" : null)">Restaurar</a>
+        <a asp-controller="History" asp-action="Index" aria-current="@(action == "History" ? "page" : null)">Histórico</a>
     </nav>
 </header>
 <main>@RenderBody()</main>
+<script src="~/js/ui.js" asp-append-version="true"></script>
 @await RenderSectionAsync("Scripts", required: false)
 </body>
 </html>

@@ -42,9 +42,13 @@ builder.Services.AddSingleton(sp => new DatabasePolicy(
 builder.Services.AddSingleton<DatabaseCatalog>();
 builder.Services.AddSingleton<BackupPathMapper>();
 builder.Services.AddSingleton<SqlRestoreService>();
+builder.Services.AddSingleton<PostRestoreService>();
+builder.Services.AddSingleton<BackupExtractor>();
+builder.Services.AddSingleton<BackupLibrary>();
 builder.Services.AddSingleton<BackupUploadService>();
 builder.Services.AddSingleton<RestoreNotifier>();
 builder.Services.AddSingleton<RestoreQueue>();
+builder.Services.AddSingleton<RestoreJobRegistry>();
 builder.Services.AddScoped<RestoreJobProcessor>();
 builder.Services.AddHostedService<RestoreWorker>();
 builder.Services.AddHostedService<RestoreMaintenanceService>();

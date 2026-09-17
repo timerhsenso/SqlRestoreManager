@@ -1,0 +1,621 @@
+From 1a802a9a8092c1e8f41fe8cf7f9f006ffe92057d Mon Sep 17 00:00:00 2001
+From: claude <c@x>
+Date: Thu, 17 Sep 2026 18:39:21 +0000
+Subject: [PATCH] Fase 4: cancelamento de job na fila ou em andamento
+
+---
+ Controllers/HistoryController.cs     | 10 ++++-
+ Controllers/RestoreController.cs     | 40 +++++++++++++++++++
+ Models/RestoreStatus.cs              |  2 +
+ Program.cs                           |  1 +
+ README.md                            | 11 +++++
+ Services/Jobs/RestoreJobProcessor.cs | 44 ++++++++++++++++++--
+ Services/Jobs/RestoreJobRegistry.cs  | 60 ++++++++++++++++++++++++++++
+ Services/Jobs/RestoreWorker.cs       | 49 ++++++++++++++++++++++-
+ Views/History/Index.cshtml           | 52 ++++++++++++++++++++++--
+ Views/Restore/Index.cshtml           | 35 +++++++++++++++-
+ 10 files changed, 294 insertions(+), 10 deletions(-)
+ create mode 100644 Services/Jobs/RestoreJobRegistry.cs
+
+diff --git a/Controllers/HistoryController.cs b/Controllers/HistoryController.cs
+index 7da22b6..7ef77ef 100644
+--- a/Controllers/HistoryController.cs
++++ b/Controllers/HistoryController.cs
+@@ -1,5 +1,7 @@
+ using Microsoft.AspNetCore.Mvc;
+ using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Options;
++using SqlRestoreManager.Configuration;
+ using SqlRestoreManager.Data;
+ 
+ namespace SqlRestoreManager.Controllers;
+@@ -9,8 +11,13 @@ public sealed class HistoryController : Controller
+     private const int MaxRows = 200;
+ 
+     private readonly AppDbContext _db;
++    private readonly RestoreOptions _options;
+ 
+-    public HistoryController(AppDbContext db) => _db = db;
++    public HistoryController(AppDbContext db, IOptions<RestoreOptions> options)
++    {
++        _db = db;
++        _options = options.Value;
++    }
+ 
+     [HttpGet]
+     public async Task<IActionResult> Index(CancellationToken ct)
+@@ -21,6 +28,7 @@ public sealed class HistoryController : Controller
+             .Take(MaxRows)
+             .ToListAsync(ct);
+ 
++        ViewBag.NodeName = _options.EffectiveNodeName;
+         return View(items);
+     }
+ }
+diff --git a/Controllers/RestoreController.cs b/Controllers/RestoreController.cs
+index 64ceb94..a2cbaa4 100644
+--- a/Controllers/RestoreController.cs
++++ b/Controllers/RestoreController.cs
+@@ -19,6 +19,7 @@ public sealed class RestoreController : Controller
+ 
+     private readonly DatabaseCatalog _catalog;
+     private readonly RestoreQueue _queue;
++    private readonly RestoreJobRegistry _registry;
+     private readonly AppDbContext _db;
+     private readonly SqlRestoreService _sql;
+     private readonly BackupUploadService _uploads;
+@@ -30,6 +31,7 @@ public sealed class RestoreController : Controller
+     public RestoreController(
+         DatabaseCatalog catalog,
+         RestoreQueue queue,
++        RestoreJobRegistry registry,
+         AppDbContext db,
+         SqlRestoreService sql,
+         BackupUploadService uploads,
+@@ -40,6 +42,7 @@ public sealed class RestoreController : Controller
+     {
+         _catalog = catalog;
+         _queue = queue;
++        _registry = registry;
+         _db = db;
+         _sql = sql;
+         _uploads = uploads;
+@@ -179,6 +182,43 @@ public sealed class RestoreController : Controller
+         }
+     }
+ 
++    /// <summary>Cancela um job desta instância (na fila ou em andamento).</summary>
++    [HttpPost]
++    public async Task<IActionResult> Cancel(Guid jobId, CancellationToken ct)
++    {
++        var history = await _db.RestoreHistory.SingleOrDefaultAsync(x => x.JobId == jobId, ct);
++        if (history is null)
++            return NotFound("Job não encontrado.");
++
++        if (!RestoreStatus.IsActive(history.Status))
++            return Conflict($"O job já está {RestoreStatus.ToLabel(history.Status).ToLowerInvariant()}.");
++
++        if (!string.Equals(history.NodeName, _options.EffectiveNodeName, StringComparison.OrdinalIgnoreCase))
++            return Conflict(
++                $"Este job está sendo processado por outra instância ({history.NodeName}). " +
++                "Cancele a partir dela.");
++
++        var (known, sessionId) = _registry.RequestCancel(jobId);
++
++        if (known && sessionId != 0)
++        {
++            // O SQL Server já está executando (verify, backup ou restore): encerra a sessão.
++            try
++            {
++                await _sql.KillSessionAsync(sessionId, ct);
++            }
++            catch (Exception ex)
++            {
++                _logger.LogWarning(ex, "Falha ao encerrar a sessão {Spid} do job {JobId}.", sessionId, jobId);
++            }
++        }
++
++        _logger.LogWarning("Cancelamento solicitado para o job {JobId} ({Status}).", jobId, history.Status);
++        return Ok(known
++            ? "Cancelamento solicitado."
++            : "Cancelamento registrado: o job será descartado quando sair da fila.");
++    }
++
+     [HttpGet]
+     public async Task<IActionResult> Status(Guid jobId, CancellationToken ct)
+     {
+diff --git a/Models/RestoreStatus.cs b/Models/RestoreStatus.cs
+index aad7803..d7890b8 100644
+--- a/Models/RestoreStatus.cs
++++ b/Models/RestoreStatus.cs
+@@ -13,6 +13,7 @@ public static class RestoreStatus
+     public const string Success = "Success";
+     public const string Warning = "Warning";
+     public const string Error = "Error";
++    public const string Canceled = "Canceled";
+     public const string Interrupted = "Interrupted";
+ 
+     /// <summary>Status que indicam job ainda não finalizado.</summary>
+@@ -33,6 +34,7 @@ public static class RestoreStatus
+         Success => "Concluído",
+         Warning => "Concluído com alertas",
+         Error => "Erro",
++        Canceled => "Cancelado",
+         Interrupted => "Interrompido",
+         _ => status
+     };
+diff --git a/Program.cs b/Program.cs
+index 7ed7db8..8ac9d86 100644
+--- a/Program.cs
++++ b/Program.cs
+@@ -48,6 +48,7 @@ builder.Services.AddSingleton<BackupLibrary>();
+ builder.Services.AddSingleton<BackupUploadService>();
+ builder.Services.AddSingleton<RestoreNotifier>();
+ builder.Services.AddSingleton<RestoreQueue>();
++builder.Services.AddSingleton<RestoreJobRegistry>();
+ builder.Services.AddScoped<RestoreJobProcessor>();
+ builder.Services.AddHostedService<RestoreWorker>();
+ builder.Services.AddHostedService<RestoreMaintenanceService>();
+diff --git a/README.md b/README.md
+index 94d06f8..d179da2 100644
+--- a/README.md
++++ b/README.md
+@@ -147,6 +147,17 @@ Por isso, use um compartilhamento da pasta temporária do servidor:
+    - login SQL `IIS APPPOOL\<pool>`: `dbcreator` + `VIEW SERVER STATE` (ou `sysadmin`)
+      e `db_datareader`/`db_datawriter` no banco `RestoreManager`.
+ 
++## Cancelar um restore
++
++Botão **Cancelar restore** na tela de execução e **Cancelar** no histórico (apenas para jobs ativos
++da mesma instância). Comportamento conforme a etapa:
++
++- ainda na fila → o job é descartado e o banco não é tocado;
++- verificando/gerando backup de segurança → a sessão do SQL Server é encerrada (`KILL`);
++- já restaurando → a sessão é encerrada e **o banco fica em estado RESTORING**, exigindo novo restore.
++
++O status final fica como `Canceled` no histórico, com a explicação do que aconteceu.
++
+ ## Limitações conhecidas (Fase 1)
+ 
+ - **Sem autenticação.** Restrinja por rede/firewall até a Fase 2.
+diff --git a/Services/Jobs/RestoreJobProcessor.cs b/Services/Jobs/RestoreJobProcessor.cs
+index 72f7ca4..e409b82 100644
+--- a/Services/Jobs/RestoreJobProcessor.cs
++++ b/Services/Jobs/RestoreJobProcessor.cs
+@@ -25,6 +25,7 @@ public sealed class RestoreJobProcessor
+     private readonly SqlRestoreService _sql;
+     private readonly PostRestoreService _postRestore;
+     private readonly BackupExtractor _extractor;
++    private readonly RestoreJobRegistry _registry;
+     private readonly BackupPathMapper _pathMapper;
+     private readonly RestoreNotifier _notifier;
+     private readonly RestoreOptions _options;
+@@ -35,6 +36,7 @@ public sealed class RestoreJobProcessor
+         SqlRestoreService sql,
+         PostRestoreService postRestore,
+         BackupExtractor extractor,
++        RestoreJobRegistry registry,
+         BackupPathMapper pathMapper,
+         RestoreNotifier notifier,
+         IOptions<RestoreOptions> options,
+@@ -44,13 +46,27 @@ public sealed class RestoreJobProcessor
+         _sql = sql;
+         _postRestore = postRestore;
+         _extractor = extractor;
++        _registry = registry;
+         _pathMapper = pathMapper;
+         _notifier = notifier;
+         _options = options.Value;
+         _logger = logger;
+     }
+ 
+-    public async Task ProcessAsync(RestoreJob job, CancellationToken stoppingToken)
++    public async Task ProcessAsync(RestoreJob job, CancellationToken hostToken)
++    {
++        using var jobCancellation = _registry.Register(job.JobId, hostToken);
++        try
++        {
++            await ExecuteAsync(job, jobCancellation.Token, hostToken);
++        }
++        finally
++        {
++            _registry.Unregister(job.JobId);
++        }
++    }
++
++    private async Task ExecuteAsync(RestoreJob job, CancellationToken stoppingToken, CancellationToken hostToken)
+     {
+         using var logScope = _logger.BeginScope(new Dictionary<string, object>
+         {
+@@ -58,7 +74,8 @@ public sealed class RestoreJobProcessor
+             ["TargetDatabase"] = job.TargetDatabase
+         });
+ 
+-        var history = await _db.RestoreHistory.SingleOrDefaultAsync(x => x.JobId == job.JobId, stoppingToken);
++        var history = await _db.RestoreHistory
++            .SingleOrDefaultAsync(x => x.JobId == job.JobId, CancellationToken.None);
+         if (history is null)
+         {
+             _logger.LogWarning("Histórico do job não encontrado; job descartado.");
+@@ -123,7 +140,12 @@ public sealed class RestoreJobProcessor
+ 
+             await _notifier.CompletedAsync(job.JobId, message, hasWarnings);
+         }
+-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
++        catch (Exception ex) when (_registry.IsCancelRequested(job.JobId))
++        {
++            _logger.LogWarning(ex, "Job cancelado pelo usuário.");
++            await EndWithFailureAsync(history, RestoreStatus.Canceled, CancelMessage(history.Status));
++        }
++        catch (OperationCanceledException) when (hostToken.IsCancellationRequested)
+         {
+             _logger.LogWarning("Aplicação encerrada antes do início do restore.");
+             await EndWithFailureAsync(history, RestoreStatus.Interrupted,
+@@ -157,7 +179,11 @@ public sealed class RestoreJobProcessor
+         RestoreHistory history, string label, int fromPercent, int toPercent, Func<Action<int>, Task<T>> start)
+     {
+         var sessionId = new StrongBox<int>(0);
+-        var task = start(spid => Volatile.Write(ref sessionId.Value, spid));
++        var task = start(spid =>
++        {
++            Volatile.Write(ref sessionId.Value, spid);
++            _registry.SetSessionId(history.JobId, spid);
++        });
+ 
+         var interval = TimeSpan.FromSeconds(_options.ProgressPollSeconds);
+         var range = toPercent - fromPercent;
+@@ -284,6 +310,16 @@ public sealed class RestoreJobProcessor
+         await _notifier.FailedAsync(history.JobId, message);
+     }
+ 
++    private static string CancelMessage(string status) => status switch
++    {
++        RestoreStatus.Restoring =>
++            "Restore cancelado durante a gravação. O banco de destino ficou em estado RESTORING e " +
++            "precisa de um novo restore para voltar a ficar utilizável.",
++        RestoreStatus.PostRestoring =>
++            "Cancelado durante o pós-restore. O banco foi restaurado, mas os ajustes podem não ter sido concluídos.",
++        _ => "Restore cancelado antes de alterar o banco de destino."
++    };
++
+     private static string? Truncate(string? value, int max) =>
+         value is null || value.Length <= max ? value : value[..max];
+ }
+diff --git a/Services/Jobs/RestoreJobRegistry.cs b/Services/Jobs/RestoreJobRegistry.cs
+new file mode 100644
+index 0000000..67fd3bb
+--- /dev/null
++++ b/Services/Jobs/RestoreJobRegistry.cs
+@@ -0,0 +1,60 @@
++using System.Collections.Concurrent;
++using System.Runtime.CompilerServices;
++
++namespace SqlRestoreManager.Services.Jobs;
++
++/// <summary>
++/// Jobs em execução nesta instância e pedidos de cancelamento.
++/// Guarda o SPID para poder encerrar a sessão do SQL Server quando o restore já começou.
++/// </summary>
++public sealed class RestoreJobRegistry
++{
++    private sealed record Entry(CancellationTokenSource Cancellation, StrongBox<int> SessionId);
++
++    private readonly ConcurrentDictionary<Guid, Entry> _running = new();
++    private readonly ConcurrentDictionary<Guid, byte> _cancelRequests = new();
++
++    /// <summary>Registra o job em execução; o token vale enquanto o job existir.</summary>
++    public CancellationTokenSource Register(Guid jobId, CancellationToken stoppingToken)
++    {
++        var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
++        _running[jobId] = new Entry(cts, new StrongBox<int>(0));
++
++        // Cancelamento pedido enquanto o job ainda estava na fila.
++        if (_cancelRequests.ContainsKey(jobId))
++            cts.Cancel();
++
++        return cts;
++    }
++
++    public void Unregister(Guid jobId)
++    {
++        if (_running.TryRemove(jobId, out var entry))
++            entry.Cancellation.Dispose();
++
++        _cancelRequests.TryRemove(jobId, out _);
++    }
++
++    /// <summary>Guarda o SPID da operação em andamento (verify, backup ou restore).</summary>
++    public void SetSessionId(Guid jobId, int sessionId)
++    {
++        if (_running.TryGetValue(jobId, out var entry))
++            Volatile.Write(ref entry.SessionId.Value, sessionId);
++    }
++
++    public bool IsCancelRequested(Guid jobId) => _cancelRequests.ContainsKey(jobId);
++
++    /// <summary>
++    /// Marca o cancelamento e devolve o SPID a encerrar (0 = nada em execução no SQL Server).
++    /// </summary>
++    public (bool Known, int SessionId) RequestCancel(Guid jobId)
++    {
++        _cancelRequests[jobId] = 1;
++
++        if (!_running.TryGetValue(jobId, out var entry))
++            return (false, 0);
++
++        entry.Cancellation.Cancel();
++        return (true, Volatile.Read(ref entry.SessionId.Value));
++    }
++}
+diff --git a/Services/Jobs/RestoreWorker.cs b/Services/Jobs/RestoreWorker.cs
+index 36b7c18..692d70e 100644
+--- a/Services/Jobs/RestoreWorker.cs
++++ b/Services/Jobs/RestoreWorker.cs
+@@ -1,3 +1,9 @@
++using Microsoft.EntityFrameworkCore;
++using SqlRestoreManager.Data;
++using SqlRestoreManager.Models;
++using SqlRestoreManager.Services.Notifications;
++using SqlRestoreManager.Services.Uploads;
++
+ namespace SqlRestoreManager.Services.Jobs;
+ 
+ /// <summary>
+@@ -6,12 +12,18 @@ namespace SqlRestoreManager.Services.Jobs;
+ public sealed class RestoreWorker : BackgroundService
+ {
+     private readonly RestoreQueue _queue;
++    private readonly RestoreJobRegistry _registry;
+     private readonly IServiceScopeFactory _scopeFactory;
+     private readonly ILogger<RestoreWorker> _logger;
+ 
+-    public RestoreWorker(RestoreQueue queue, IServiceScopeFactory scopeFactory, ILogger<RestoreWorker> logger)
++    public RestoreWorker(
++        RestoreQueue queue,
++        RestoreJobRegistry registry,
++        IServiceScopeFactory scopeFactory,
++        ILogger<RestoreWorker> logger)
+     {
+         _queue = queue;
++        _registry = registry;
+         _scopeFactory = scopeFactory;
+         _logger = logger;
+     }
+@@ -27,6 +39,13 @@ public sealed class RestoreWorker : BackgroundService
+                 try
+                 {
+                     await using var scope = _scopeFactory.CreateAsyncScope();
++                    if (_registry.IsCancelRequested(job.JobId))
++                    {
++                        _logger.LogInformation("Job {JobId} cancelado enquanto estava na fila.", job.JobId);
++                        await MarkCanceledAsync(scope.ServiceProvider, job);
++                        continue;
++                    }
++
+                     var processor = scope.ServiceProvider.GetRequiredService<RestoreJobProcessor>();
+                     await processor.ProcessAsync(job, stoppingToken);
+                 }
+@@ -47,4 +66,32 @@ public sealed class RestoreWorker : BackgroundService
+ 
+         _logger.LogInformation("Worker de restore finalizado.");
+     }
++
++    private async Task MarkCanceledAsync(IServiceProvider services, RestoreJob job)
++    {
++        try
++        {
++            var db = services.GetRequiredService<AppDbContext>();
++            var history = await db.RestoreHistory.SingleOrDefaultAsync(x => x.JobId == job.JobId);
++            if (history is not null)
++            {
++                history.Status = RestoreStatus.Canceled;
++                history.CurrentStep = RestoreStatus.ToLabel(RestoreStatus.Canceled);
++                history.ErrorMessage = "Cancelado antes de iniciar. O banco de destino não foi alterado.";
++                history.FinishedAt = DateTime.Now;
++                await db.SaveChangesAsync();
++            }
++
++            var notifier = services.GetRequiredService<RestoreNotifier>();
++            await notifier.FailedAsync(job.JobId, "Restore cancelado.");
++        }
++        catch (Exception ex)
++        {
++            _logger.LogWarning(ex, "Falha ao registrar cancelamento do job {JobId}.", job.JobId);
++        }
++        finally
++        {
++            TempFolder.TryDelete(job.JobFolder, _logger);
++        }
++    }
+ }
+diff --git a/Views/History/Index.cshtml b/Views/History/Index.cshtml
+index 3ad3a67..78b3211 100644
+--- a/Views/History/Index.cshtml
++++ b/Views/History/Index.cshtml
+@@ -1,6 +1,7 @@
+ @model IEnumerable<RestoreHistory>
+ @{
+     ViewData["Title"] = "Histórico";
++    var nodeName = (string)ViewBag.NodeName;
+ }
+ @functions {
+     static string BadgeClass(string status) => status switch
+@@ -30,12 +31,13 @@
+                     <th>Log (MB)</th>
+                     <th>Fim</th>
+                     <th>Instância</th>
++                    <th></th>
+                 </tr>
+             </thead>
+             <tbody>
+                 @if (!Model.Any())
+                 {
+-                    <tr><td colspan="11" class="muted">Nenhum restore executado ainda.</td></tr>
++                    <tr><td colspan="12" class="muted">Nenhum restore executado ainda.</td></tr>
+                 }
+                 @foreach (var x in Model)
+                 {
+@@ -72,15 +74,23 @@
+                         </td>
+                         <td class="num">@(x.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss") ?? "-")</td>
+                         <td>@(x.NodeName ?? "-")</td>
++                        <td>
++                            @if (RestoreStatus.IsActive(x.Status) &&
++                                 string.Equals(x.NodeName, nodeName, StringComparison.OrdinalIgnoreCase))
++                            {
++                                <button type="button" class="btn-ghost btn-small js-cancel"
++                                        data-job="@x.JobId" data-db="@x.TargetDatabase">Cancelar</button>
++                            }
++                        </td>
+                     </tr>
+                     if (!string.IsNullOrWhiteSpace(x.ErrorMessage))
+                     {
+-                        <tr><td colspan="11"><div class="alert alert-error">@x.ErrorMessage</div></td></tr>
++                        <tr><td colspan="12"><div class="alert alert-error">@x.ErrorMessage</div></td></tr>
+                     }
+                     if (!string.IsNullOrWhiteSpace(x.PostRestoreLog))
+                     {
+                         <tr>
+-                            <td colspan="11">
++                            <td colspan="12">
+                                 <details open="@(x.Status == RestoreStatus.Warning ? "open" : null)">
+                                     <summary>Pós-restore</summary>
+                                     <pre class="log">@x.PostRestoreLog</pre>
+@@ -93,3 +103,39 @@
+         </table>
+     </div>
+ </section>
++
++@section Scripts {
++<script>
++(() => {
++    "use strict";
++    const cancelUrl = "@Url.Action("Cancel", "Restore")";
++
++    for (const button of document.querySelectorAll(".js-cancel")) {
++        button.addEventListener("click", async () => {
++            const confirmed = await ui.confirm({
++                title: `Cancelar o restore de ${button.dataset.db}?`,
++                message: "Se a gravação já tiver começado, o banco ficará em estado RESTORING "
++                       + "e precisará de um novo restore.",
++                confirmText: "Cancelar restore",
++                cancelText: "Voltar",
++                danger: true
++            });
++            if (!confirmed) return;
++
++            button.disabled = true;
++            try {
++                const response = await fetch(`${cancelUrl}?jobId=${encodeURIComponent(button.dataset.job)}`,
++                                             { method: "POST" });
++                const text = await response.text();
++                ui.toast(text, { type: response.ok ? "warn" : "error" });
++                if (response.ok) setTimeout(() => location.reload(), 2500);
++                else button.disabled = false;
++            } catch (err) {
++                ui.toast(err.message, { type: "error" });
++                button.disabled = false;
++            }
++        });
++    }
++})();
++</script>
++}
+diff --git a/Views/Restore/Index.cshtml b/Views/Restore/Index.cshtml
+index 303e306..d41f73c 100644
+--- a/Views/Restore/Index.cshtml
++++ b/Views/Restore/Index.cshtml
+@@ -101,6 +101,9 @@
+             <div class="track" id="restoreTrack"><div id="restoreBar"></div></div>
+             <div class="console-note" id="restoreText">Na fila...</div>
+         </div>
++        <div class="actions">
++            <button type="button" id="btnCancel" class="btn-danger btn-small">Cancelar restore</button>
++        </div>
+     </div>
+ 
+     <div id="error" class="alert alert-error hidden" role="alert"></div>
+@@ -119,6 +122,7 @@
+         start: "@Url.Action("Start", "Restore")",
+         startFromFile: "@Url.Action("StartFromFile", "Restore")",
+         files: "@Url.Action("Files", "Restore")",
++        cancel: "@Url.Action("Cancel", "Restore")",
+         hub: "@Url.Content("~/restoreHub")"
+     };
+     const maxBytes = @maxUploadMb * 1024 * 1024;
+@@ -126,7 +130,7 @@
+     const allowNewDatabases = @(Model.AllowNewDatabases ? "true" : "false");
+     const allowedExtensions = @Html.Raw(Json.Serialize(Model.AllowedExtensions));
+     const databaseNameRegex = /^[\p{L}\p{N}_\-. ]{1,128}$/u;
+-    const terminalFailures = ["Error", "Interrupted"];
++    const terminalFailures = ["Error", "Interrupted", "Canceled"];
+ 
+     const $ = id => document.getElementById(id);
+     const form = $("restoreForm");
+@@ -137,6 +141,7 @@
+     const newDatabaseInput = $("newDatabase");
+     const sessionsBox = $("sessions");
+     const submitButton = $("btnSubmit");
++    const cancelButton = $("btnCancel");
+     const errorBox = $("error");
+     const successBox = $("success");
+ 
+@@ -158,6 +163,7 @@
+     function fail(message) {
+         finished = true;
+         submitButton.disabled = false;
++        cancelButton.disabled = true;
+         setProgress("restore", 0, false);
+         show(errorBox, message || "Falha no restore.");
+         ui.toast(message || "Falha no restore.", { type: "error", timeout: 0 });
+@@ -166,6 +172,7 @@
+     function succeed(message, hasWarnings) {
+         finished = true;
+         submitButton.disabled = false;
++        cancelButton.disabled = true;
+         setProgress("restore", 100, false);
+         $("restoreText").textContent = hasWarnings ? "Concluído com alertas." : "Concluído.";
+         show(successBox, message);
+@@ -411,6 +418,7 @@
+         if (!confirmed) return;
+ 
+         submitButton.disabled = true;
++        cancelButton.disabled = false;
+         finished = false;
+         currentJobId = null;
+         setProgress("upload", fromLibrary ? 100 : 0, !fromLibrary);
+@@ -447,6 +455,31 @@
+         }
+     });
+ 
++    cancelButton.addEventListener("click", async () => {
++        if (!currentJobId || finished) return;
++
++        const confirmed = await ui.confirm({
++            title: "Cancelar restore?",
++            message: "Se a gravação já tiver começado, o banco de destino ficará em estado RESTORING "
++                   + "e precisará de um novo restore para voltar a funcionar.",
++            confirmText: "Cancelar restore",
++            cancelText: "Continuar restaurando",
++            danger: true
++        });
++        if (!confirmed) return;
++
++        cancelButton.disabled = true;
++        try {
++            const response = await fetch(`${urls.cancel}?jobId=${encodeURIComponent(currentJobId)}`, { method: "POST" });
++            const text = await response.text();
++            ui.toast(text, { type: response.ok ? "warn" : "error" });
++            if (!response.ok) cancelButton.disabled = false;
++        } catch (err) {
++            ui.toast(err.message, { type: "error" });
++            cancelButton.disabled = false;
++        }
++    });
++
+     dbSelect.addEventListener("change", loadSessions);
+     if (allowNewDatabases) applyTarget();
+     if (libraryEnabled) applyOrigin();
+-- 
+2.43.0
+

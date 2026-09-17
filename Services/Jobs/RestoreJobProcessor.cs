@@ -17,10 +17,15 @@ public sealed class RestoreJobProcessor
 {
     private const int ErrorMessageMaxLength = 4000;
     private const int StepMaxLength = 200;
-    private const int RestoreStartPercent = 12;
+    private const int VerifyStartPercent = 8;
+    private const int SafetyStartPercent = 16;
+    private const int RestoreStartPercent = 28;
 
     private readonly AppDbContext _db;
     private readonly SqlRestoreService _sql;
+    private readonly PostRestoreService _postRestore;
+    private readonly BackupExtractor _extractor;
+    private readonly RestoreJobRegistry _registry;
     private readonly BackupPathMapper _pathMapper;
     private readonly RestoreNotifier _notifier;
     private readonly RestoreOptions _options;
@@ -29,6 +34,9 @@ public sealed class RestoreJobProcessor
     public RestoreJobProcessor(
         AppDbContext db,
         SqlRestoreService sql,
+        PostRestoreService postRestore,
+        BackupExtractor extractor,
+        RestoreJobRegistry registry,
         BackupPathMapper pathMapper,
         RestoreNotifier notifier,
         IOptions<RestoreOptions> options,
@@ -36,13 +44,29 @@ public sealed class RestoreJobProcessor
     {
         _db = db;
         _sql = sql;
+        _postRestore = postRestore;
+        _extractor = extractor;
+        _registry = registry;
         _pathMapper = pathMapper;
         _notifier = notifier;
         _options = options.Value;
         _logger = logger;
     }
 
-    public async Task ProcessAsync(RestoreJob job, CancellationToken stoppingToken)
+    public async Task ProcessAsync(RestoreJob job, CancellationToken hostToken)
+    {
+        using var jobCancellation = _registry.Register(job.JobId, hostToken);
+        try
+        {
+            await ExecuteAsync(job, jobCancellation.Token, hostToken);
+        }
+        finally
+        {
+            _registry.Unregister(job.JobId);
+        }
+    }
+
+    private async Task ExecuteAsync(RestoreJob job, CancellationToken stoppingToken, CancellationToken hostToken)
     {
         using var logScope = _logger.BeginScope(new Dictionary<string, object>
         {
@@ -50,7 +74,8 @@ public sealed class RestoreJobProcessor
             ["TargetDatabase"] = job.TargetDatabase
         });
 
-        var history = await _db.RestoreHistory.SingleOrDefaultAsync(x => x.JobId == job.JobId, stoppingToken);
+        var history = await _db.RestoreHistory
+            .SingleOrDefaultAsync(x => x.JobId == job.JobId, CancellationToken.None);
         if (history is null)
         {
             _logger.LogWarning("Histórico do job não encontrado; job descartado.");
@@ -61,7 +86,7 @@ public sealed class RestoreJobProcessor
         try
         {
             await StepAsync(history, RestoreStatus.Preparing, "Preparando arquivo de backup...", 3, stoppingToken);
-            var localBackup = await Task.Run(() => _sql.PrepareBackup(job.UploadedPath, job.JobFolder), stoppingToken);
+            var localBackup = await _extractor.PrepareAsync(job.SourcePath, job.JobFolder, stoppingToken);
             var sqlBackup = _pathMapper.ToSqlServerPath(localBackup);
 
             await StepAsync(history, RestoreStatus.Validating, "Validando backup no SQL Server...", 8, stoppingToken);
@@ -72,29 +97,56 @@ public sealed class RestoreJobProcessor
             history.BackupFinishDate = backup.BackupFinishDate;
             history.BackupServerName = Truncate(backup.ServerName, 128);
 
+            if (_options.PreRestore.VerifyBackup)
+            {
+                await StepAsync(history, RestoreStatus.Verifying, "Verificando integridade do backup...",
+                    VerifyStartPercent, stoppingToken);
+
+                await RunWithProgressAsync(history, "Verificando backup", VerifyStartPercent, SafetyStartPercent,
+                    onSpid => _sql.VerifyBackupAsync(
+                        sqlBackup, backup.Position, backup.HasChecksums, onSpid, stoppingToken));
+            }
+
+            await CreateSafetyBackupAsync(history, job.TargetDatabase, stoppingToken);
+
             await StepAsync(history, RestoreStatus.Restoring,
                 $"Encerrando conexões e restaurando '{backup.SourceDatabase}'...",
                 RestoreStartPercent, stoppingToken);
 
-            var result = await RunRestoreWithProgressAsync(
-                history, new RestoreRequest(job.TargetDatabase, sqlBackup, backup), stoppingToken);
+            var result = await RunWithProgressAsync(history, "Restaurando", RestoreStartPercent, 99,
+                onSpid => _sql.RestoreAsync(
+                    new RestoreRequest(job.TargetDatabase, sqlBackup, backup), onSpid, stoppingToken));
 
             history.DisconnectedSessions = result.DisconnectedSessions;
-            history.Status = RestoreStatus.Success;
-            history.PercentComplete = 100;
-            history.CurrentStep = "Restore concluído.";
-            history.ErrorMessage = null;
-            history.FinishedAt = DateTime.Now;
-            await _db.SaveChangesAsync(CancellationToken.None);
-
             _logger.LogInformation(
                 "Restore concluído. Origem {SourceDatabase}, {Sessions} sessões encerradas.",
                 backup.SourceDatabase, result.DisconnectedSessions);
 
-            await _notifier.CompletedAsync(job.JobId,
-                $"Restore concluído: '{backup.SourceDatabase}' → '{job.TargetDatabase}'.");
+            // O banco já está restaurado: a partir daqui nada é cancelado nem vira "Error".
+            var post = await RunPostRestoreAsync(history, job.TargetDatabase);
+            var hasWarnings = post?.HasWarnings == true;
+
+            history.Status = hasWarnings ? RestoreStatus.Warning : RestoreStatus.Success;
+            history.PercentComplete = 100;
+            history.CurrentStep = hasWarnings ? "Restore concluído com alertas no pós-restore." : "Restore concluído.";
+            history.ErrorMessage = null;
+            history.FinishedAt = DateTime.Now;
+            await _db.SaveChangesAsync(CancellationToken.None);
+
+            var message = $"Restore concluído: '{backup.SourceDatabase}' → '{job.TargetDatabase}'.";
+            if (post?.LogSizeBeforeMB is { } before && post.LogSizeAfterMB is { } after && before != after)
+                message += $" Log: {before:N0} MB → {after:N0} MB.";
+            if (hasWarnings)
+                message += " Há alertas no pós-restore: veja o Histórico.";
+
+            await _notifier.CompletedAsync(job.JobId, message, hasWarnings);
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (Exception ex) when (_registry.IsCancelRequested(job.JobId))
+        {
+            _logger.LogWarning(ex, "Job cancelado pelo usuário.");
+            await EndWithFailureAsync(history, RestoreStatus.Canceled, CancelMessage(history.Status));
+        }
+        catch (OperationCanceledException) when (hostToken.IsCancellationRequested)
         {
             _logger.LogWarning("Aplicação encerrada antes do início do restore.");
             await EndWithFailureAsync(history, RestoreStatus.Interrupted,
@@ -111,30 +163,39 @@ public sealed class RestoreJobProcessor
         }
     }
 
-    private async Task<RestoreResult> RunRestoreWithProgressAsync(
-        RestoreHistory history, RestoreRequest request, CancellationToken stoppingToken)
+    /// <summary>Sobrecarga para operações sem retorno (ex.: VERIFYONLY).</summary>
+    private Task RunWithProgressAsync(
+        RestoreHistory history, string label, int fromPercent, int toPercent, Func<Action<int>, Task> start) =>
+        RunWithProgressAsync<bool>(history, label, fromPercent, toPercent, async onSpid =>
+        {
+            await start(onSpid);
+            return true;
+        });
+
+    /// <summary>
+    /// Executa uma operação longa do SQL Server (verify, backup ou restore) acompanhando
+    /// percent_complete pelo SPID. Falha de monitoramento nunca interrompe a operação.
+    /// </summary>
+    private async Task<T> RunWithProgressAsync<T>(
+        RestoreHistory history, string label, int fromPercent, int toPercent, Func<Action<int>, Task<T>> start)
     {
         var sessionId = new StrongBox<int>(0);
-
-        using var stoppingRegistration = stoppingToken.Register(() =>
-            _logger.LogWarning(
-                "Encerramento solicitado com RESTORE em andamento. Configure o App Pool do IIS " +
-                "(idleTimeout=0, sem reciclagem periódica) para evitar interrupções."));
-
-        var restoreTask = _sql.RestoreAsync(
-            request,
-            spid => Volatile.Write(ref sessionId.Value, spid),
-            stoppingToken);
+        var task = start(spid =>
+        {
+            Volatile.Write(ref sessionId.Value, spid);
+            _registry.SetSessionId(history.JobId, spid);
+        });
 
         var interval = TimeSpan.FromSeconds(_options.ProgressPollSeconds);
-        var lastPercent = RestoreStartPercent;
+        var range = toPercent - fromPercent;
+        var lastPercent = fromPercent;
 
-        while (!restoreTask.IsCompleted)
+        while (!task.IsCompleted)
         {
-            await Task.WhenAny(restoreTask, Task.Delay(interval, CancellationToken.None));
+            await Task.WhenAny(task, Task.Delay(interval, CancellationToken.None));
 
             var spid = Volatile.Read(ref sessionId.Value);
-            if (restoreTask.IsCompleted || spid == 0)
+            if (task.IsCompleted || spid == 0)
                 continue;
 
             try
@@ -143,24 +204,83 @@ public sealed class RestoreJobProcessor
                 if (percent is null)
                     continue;
 
-                var mapped = Math.Clamp(RestoreStartPercent + (int)(percent.Value * 0.87), RestoreStartPercent, 99);
+                var mapped = Math.Clamp(fromPercent + (int)(percent.Value * range / 100d), fromPercent, toPercent);
                 if (mapped <= lastPercent)
                     continue;
 
                 lastPercent = mapped;
                 history.PercentComplete = mapped;
-                history.CurrentStep = $"Restaurando... {percent.Value:0}%";
+                history.CurrentStep = $"{label}... {percent.Value:0}%";
                 await _db.SaveChangesAsync(CancellationToken.None);
                 await _notifier.ProgressAsync(history.JobId, history.Status, history.CurrentStep, mapped);
             }
             catch (Exception ex)
             {
-                // Falha de monitoramento NÃO interrompe o restore.
-                _logger.LogWarning(ex, "Falha ao consultar/persistir progresso; o restore continua.");
+                _logger.LogWarning(ex, "Falha ao consultar/persistir progresso; a operação continua.");
             }
         }
 
-        return await restoreTask;
+        return await task;
+    }
+
+    /// <summary>Backup COPY_ONLY do banco atual antes de sobrescrevê-lo.</summary>
+    private async Task CreateSafetyBackupAsync(RestoreHistory history, string database, CancellationToken ct)
+    {
+        var options = _options.PreRestore;
+        if (!options.SafetyBackup || string.IsNullOrWhiteSpace(options.SafetyBackupPath))
+            return;
+
+        if (!await _sql.DatabaseExistsAsync(database, ct))
+        {
+            _logger.LogInformation("Banco {Database} ainda não existe: backup de segurança ignorado.", database);
+            return;
+        }
+
+        await StepAsync(history, RestoreStatus.SafetyBackup,
+            "Gerando backup de segurança do banco atual...", SafetyStartPercent, ct);
+
+        var path = await RunWithProgressAsync(history, "Backup de segurança", SafetyStartPercent, RestoreStartPercent,
+            onSpid => _sql.CreateSafetyBackupAsync(database, options.SafetyBackupPath!, onSpid, ct));
+
+        history.SafetyBackupPath = Truncate(path, 512);
+        await _db.SaveChangesAsync(ct);
+        _logger.LogInformation("Backup de segurança gerado em {Path}.", path);
+
+        try
+        {
+            await _sql.CleanupSafetyBackupsAsync(options.SafetyBackupPath!, options.SafetyBackupRetentionDays, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Falha ao limpar backups de segurança antigos.");
+        }
+    }
+
+    private async Task<PostRestoreResult?> RunPostRestoreAsync(RestoreHistory history, string database)
+    {
+        if (!_options.PostRestore.Enabled)
+            return null;
+
+        try
+        {
+            await StepAsync(history, RestoreStatus.PostRestoring, "Executando ajustes pós-restore...", 99,
+                CancellationToken.None);
+
+            var result = await _postRestore.RunAsync(database, message =>
+                _notifier.ProgressAsync(history.JobId, RestoreStatus.PostRestoring, message, 99));
+
+            history.LogSizeBeforeMB = result.LogSizeBeforeMB;
+            history.LogSizeAfterMB = result.LogSizeAfterMB;
+            history.PostRestoreLog = result.Summary;
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Falha inesperada no pós-restore.");
+            history.PostRestoreLog = $"[ALERTA] Pós-restore: {ex.Message}";
+            return new PostRestoreResult(
+                [new PostRestoreStep("Pós-restore", false, ex.Message)], null, null);
+        }
     }
 
     private async Task StepAsync(
@@ -190,6 +310,16 @@ public sealed class RestoreJobProcessor
 
         await _notifier.FailedAsync(history.JobId, message);
     }
+
+    private static string CancelMessage(string status) => status switch
+    {
+        RestoreStatus.Restoring =>
+            "Restore cancelado durante a gravação. O banco de destino ficou em estado RESTORING e " +
+            "precisa de um novo restore para voltar a ficar utilizável.",
+        RestoreStatus.PostRestoring =>
+            "Cancelado durante o pós-restore. O banco foi restaurado, mas os ajustes podem não ter sido concluídos.",
+        _ => "Restore cancelado antes de alterar o banco de destino."
+    };
 
     private static string? Truncate(string? value, int max) =>
         value is null || value.Length <= max ? value : value[..max];

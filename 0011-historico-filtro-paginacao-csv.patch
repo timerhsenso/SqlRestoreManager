@@ -1,0 +1,368 @@
+From e7f5146d32ec4094daca2616284ae333854d7109 Mon Sep 17 00:00:00 2001
+From: claude <c@x>
+Date: Thu, 17 Sep 2026 18:40:49 +0000
+Subject: [PATCH] Historico com filtro, paginacao e exportacao CSV
+
+---
+ Controllers/HistoryController.cs | 107 +++++++++++++++++++++++++++++--
+ Models/HistoryViewModel.cs       |  29 +++++++++
+ README.md                        |   6 ++
+ Views/History/Index.cshtml       |  80 ++++++++++++++++++++---
+ wwwroot/css/site.css             |  25 ++++++++
+ 5 files changed, 232 insertions(+), 15 deletions(-)
+ create mode 100644 Models/HistoryViewModel.cs
+
+diff --git a/Controllers/HistoryController.cs b/Controllers/HistoryController.cs
+index 7ef77ef..49ab541 100644
+--- a/Controllers/HistoryController.cs
++++ b/Controllers/HistoryController.cs
+@@ -1,14 +1,21 @@
++using System.Globalization;
++using System.Text;
+ using Microsoft.AspNetCore.Mvc;
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Options;
+ using SqlRestoreManager.Configuration;
+ using SqlRestoreManager.Data;
++using SqlRestoreManager.Models;
+ 
+ namespace SqlRestoreManager.Controllers;
+ 
+ public sealed class HistoryController : Controller
+ {
+-    private const int MaxRows = 200;
++    private const int DefaultPageSize = 25;
++    private const int MaxPageSize = 200;
++    private const int MaxExportRows = 10_000;
++
++    private static readonly CultureInfo Culture = new("pt-BR");
+ 
+     private readonly AppDbContext _db;
+     private readonly RestoreOptions _options;
+@@ -20,15 +27,101 @@ public sealed class HistoryController : Controller
+     }
+ 
+     [HttpGet]
+-    public async Task<IActionResult> Index(CancellationToken ct)
++    public async Task<IActionResult> Index(
++        string? q, string? status, int page = 1, int pageSize = DefaultPageSize, CancellationToken ct = default)
+     {
+-        var items = await _db.RestoreHistory
+-            .AsNoTracking()
++        page = Math.Max(1, page);
++        pageSize = Math.Clamp(pageSize, 10, MaxPageSize);
++
++        var query = Filter(q, status);
++        var total = await query.CountAsync(ct);
++
++        var items = await query
+             .OrderByDescending(x => x.StartedAt)
+-            .Take(MaxRows)
++            .Skip((page - 1) * pageSize)
++            .Take(pageSize)
+             .ToListAsync(ct);
+ 
+-        ViewBag.NodeName = _options.EffectiveNodeName;
+-        return View(items);
++        return View(new HistoryViewModel
++        {
++            Items = items,
++            Query = q,
++            Status = status,
++            Page = page,
++            PageSize = pageSize,
++            Total = total,
++            NodeName = _options.EffectiveNodeName
++        });
++    }
++
++    /// <summary>CSV com o mesmo filtro da tela (separador ';' e BOM, para o Excel pt-BR).</summary>
++    [HttpGet]
++    public async Task<IActionResult> Export(string? q, string? status, CancellationToken ct = default)
++    {
++        var items = await Filter(q, status)
++            .OrderByDescending(x => x.StartedAt)
++            .Take(MaxExportRows)
++            .ToListAsync(ct);
++
++        var csv = new StringBuilder();
++        csv.AppendLine(string.Join(';',
++            "Inicio", "Fim", "Arquivo", "TamanhoMB", "Origem", "ServidorOrigem", "Destino", "BackupDe",
++            "Status", "Progresso", "ConexoesEncerradas", "LogAntesMB", "LogDepoisMB", "BackupSeguranca",
++            "Instancia", "Mensagem"));
++
++        foreach (var x in items)
++        {
++            csv.AppendLine(string.Join(';',
++                Field(x.StartedAt.ToString("dd/MM/yyyy HH:mm:ss", Culture)),
++                Field(x.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss", Culture)),
++                Field(x.OriginalFileName),
++                Field((x.FileSizeBytes / 1024d / 1024d).ToString("N1", Culture)),
++                Field(x.SourceDatabase),
++                Field(x.BackupServerName),
++                Field(x.TargetDatabase),
++                Field(x.BackupFinishDate?.ToString("dd/MM/yyyy HH:mm", Culture)),
++                Field(RestoreStatus.ToLabel(x.Status)),
++                Field(x.PercentComplete.ToString(Culture)),
++                Field(x.DisconnectedSessions.ToString(Culture)),
++                Field(x.LogSizeBeforeMB?.ToString(Culture)),
++                Field(x.LogSizeAfterMB?.ToString(Culture)),
++                Field(x.SafetyBackupPath),
++                Field(x.NodeName),
++                Field(x.ErrorMessage ?? x.CurrentStep)));
++        }
++
++        var bytes = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(csv.ToString())).ToArray();
++        return File(bytes, "text/csv", $"restores_{DateTime.Now:yyyyMMdd_HHmm}.csv");
++    }
++
++    private IQueryable<RestoreHistory> Filter(string? q, string? status)
++    {
++        var query = _db.RestoreHistory.AsNoTracking();
++
++        if (!string.IsNullOrWhiteSpace(q))
++        {
++            var term = q.Trim();
++            query = query.Where(x =>
++                EF.Functions.Like(x.OriginalFileName, $"%{term}%") ||
++                EF.Functions.Like(x.TargetDatabase, $"%{term}%") ||
++                (x.SourceDatabase != null && EF.Functions.Like(x.SourceDatabase, $"%{term}%")));
++        }
++
++        if (string.Equals(status, "active", StringComparison.OrdinalIgnoreCase))
++            query = query.Where(x => RestoreStatus.Active.Contains(x.Status));
++        else if (!string.IsNullOrWhiteSpace(status))
++            query = query.Where(x => x.Status == status);
++
++        return query;
++    }
++
++    /// <summary>Escapa o campo para CSV (aspas e quebras de linha).</summary>
++    private static string Field(string? value)
++    {
++        if (string.IsNullOrEmpty(value))
++            return string.Empty;
++
++        var normalized = value.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
++        return $"\"{normalized.Replace("\"", "\"\"")}\"";
+     }
+ }
+diff --git a/Models/HistoryViewModel.cs b/Models/HistoryViewModel.cs
+new file mode 100644
+index 0000000..a192320
+--- /dev/null
++++ b/Models/HistoryViewModel.cs
+@@ -0,0 +1,29 @@
++namespace SqlRestoreManager.Models;
++
++public sealed class HistoryViewModel
++{
++    public IReadOnlyList<RestoreHistory> Items { get; init; } = [];
++    public string? Query { get; init; }
++    public string? Status { get; init; }
++    public int Page { get; init; } = 1;
++    public int PageSize { get; init; } = 25;
++    public int Total { get; init; }
++    public string NodeName { get; init; } = string.Empty;
++
++    public int TotalPages => Math.Max(1, (int)Math.Ceiling(Total / (double)PageSize));
++    public int FirstRow => Total == 0 ? 0 : ((Page - 1) * PageSize) + 1;
++    public int LastRow => Math.Min(Page * PageSize, Total);
++    public bool HasPrevious => Page > 1;
++    public bool HasNext => Page < TotalPages;
++
++    public static readonly (string Value, string Label)[] StatusFilters =
++    [
++        ("", "Todos os status"),
++        ("active", "Em andamento"),
++        (RestoreStatus.Success, "Concluído"),
++        (RestoreStatus.Warning, "Concluído com alertas"),
++        (RestoreStatus.Error, "Erro"),
++        (RestoreStatus.Canceled, "Cancelado"),
++        (RestoreStatus.Interrupted, "Interrompido")
++    ];
++}
+diff --git a/README.md b/README.md
+index d179da2..69a14b1 100644
+--- a/README.md
++++ b/README.md
+@@ -147,6 +147,12 @@ Por isso, use um compartilhamento da pasta temporária do servidor:
+    - login SQL `IIS APPPOOL\<pool>`: `dbcreator` + `VIEW SERVER STATE` (ou `sysadmin`)
+      e `db_datareader`/`db_datawriter` no banco `RestoreManager`.
+ 
++## Histórico
++
++Busca por arquivo/banco, filtro por status, tamanho de página e **exportação CSV** (separador `;`
++com BOM, abre direto no Excel pt-BR) respeitando o filtro atual. Tudo processado no servidor,
++sem biblioteca de grid.
++
+ ## Cancelar um restore
+ 
+ Botão **Cancelar restore** na tela de execução e **Cancelar** no histórico (apenas para jobs ativos
+diff --git a/Views/History/Index.cshtml b/Views/History/Index.cshtml
+index 78b3211..aa666dd 100644
+--- a/Views/History/Index.cshtml
++++ b/Views/History/Index.cshtml
+@@ -1,20 +1,63 @@
+-@model IEnumerable<RestoreHistory>
++@model HistoryViewModel
+ @{
+     ViewData["Title"] = "Histórico";
+-    var nodeName = (string)ViewBag.NodeName;
+ }
+ @functions {
+     static string BadgeClass(string status) => status switch
+     {
+         RestoreStatus.Success => "badge-ok",
+         RestoreStatus.Warning => "badge-warn",
+-        RestoreStatus.Error or RestoreStatus.Interrupted => "badge-error",
++        RestoreStatus.Error or RestoreStatus.Interrupted or RestoreStatus.Canceled => "badge-error",
+         _ => "badge-active"
+     };
+ }
+ <section class="card wide">
+     <h1>Histórico de restores</h1>
+-    <p class="card-lead">Últimos 200 jobs, do mais recente para o mais antigo.</p>
++    <p class="card-lead">
++        @if (Model.Total == 0)
++        {
++            <text>Nenhum registro encontrado com esse filtro.</text>
++        }
++        else
++        {
++            <text>Mostrando @Model.FirstRow–@Model.LastRow de @Model.Total registro(s).</text>
++        }
++    </p>
++
++    <form method="get" class="filters">
++        <input type="text" name="q" value="@Model.Query" placeholder="Arquivo, banco de origem ou destino" />
++        <select name="status">
++            @foreach (var (value, label) in HistoryViewModel.StatusFilters)
++            {
++                if (value == (Model.Status ?? string.Empty))
++                {
++                    <option value="@value" selected>@label</option>
++                }
++                else
++                {
++                    <option value="@value">@label</option>
++                }
++            }
++        </select>
++        <select name="pageSize">
++            @foreach (var size in new[] { 25, 50, 100, 200 })
++            {
++                if (size == Model.PageSize)
++                {
++                    <option value="@size" selected>@size por página</option>
++                }
++                else
++                {
++                    <option value="@size">@size por página</option>
++                }
++            }
++        </select>
++        <button type="submit">Filtrar</button>
++        <a asp-action="Index" class="btn-link">Limpar</a>
++        <a asp-action="Export" asp-route-q="@Model.Query" asp-route-status="@Model.Status" class="btn-link">
++            Exportar CSV
++        </a>
++    </form>
+ 
+     <div class="table-scroll">
+         <table>
+@@ -35,11 +78,11 @@
+                 </tr>
+             </thead>
+             <tbody>
+-                @if (!Model.Any())
++                @if (Model.Items.Count == 0)
+                 {
+-                    <tr><td colspan="12" class="muted">Nenhum restore executado ainda.</td></tr>
++                    <tr><td colspan="12" class="muted">Nada para mostrar.</td></tr>
+                 }
+-                @foreach (var x in Model)
++                @foreach (var x in Model.Items)
+                 {
+                     <tr>
+                         <td class="num">@x.StartedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
+@@ -76,7 +119,7 @@
+                         <td>@(x.NodeName ?? "-")</td>
+                         <td>
+                             @if (RestoreStatus.IsActive(x.Status) &&
+-                                 string.Equals(x.NodeName, nodeName, StringComparison.OrdinalIgnoreCase))
++                                 string.Equals(x.NodeName, Model.NodeName, StringComparison.OrdinalIgnoreCase))
+                             {
+                                 <button type="button" class="btn-ghost btn-small js-cancel"
+                                         data-job="@x.JobId" data-db="@x.TargetDatabase">Cancelar</button>
+@@ -87,6 +130,10 @@
+                     {
+                         <tr><td colspan="12"><div class="alert alert-error">@x.ErrorMessage</div></td></tr>
+                     }
++                    if (!string.IsNullOrWhiteSpace(x.SafetyBackupPath))
++                    {
++                        <tr><td colspan="12"><div class="sub">Backup de segurança: @x.SafetyBackupPath</div></td></tr>
++                    }
+                     if (!string.IsNullOrWhiteSpace(x.PostRestoreLog))
+                     {
+                         <tr>
+@@ -102,6 +149,23 @@
+             </tbody>
+         </table>
+     </div>
++
++    @if (Model.TotalPages > 1)
++    {
++        <div class="pager">
++            @if (Model.HasPrevious)
++            {
++                <a class="btn-link" asp-action="Index" asp-route-q="@Model.Query" asp-route-status="@Model.Status"
++                   asp-route-pageSize="@Model.PageSize" asp-route-page="@(Model.Page - 1)">Anterior</a>
++            }
++            <span class="muted">Página @Model.Page de @Model.TotalPages</span>
++            @if (Model.HasNext)
++            {
++                <a class="btn-link" asp-action="Index" asp-route-q="@Model.Query" asp-route-status="@Model.Status"
++                   asp-route-pageSize="@Model.PageSize" asp-route-page="@(Model.Page + 1)">Próxima</a>
++            }
++        </div>
++    }
+ </section>
+ 
+ @section Scripts {
+diff --git a/wwwroot/css/site.css b/wwwroot/css/site.css
+index ce8ce2f..f6dce3a 100644
+--- a/wwwroot/css/site.css
++++ b/wwwroot/css/site.css
+@@ -319,3 +319,28 @@ dialog.modal::backdrop { background: rgba(14, 22, 30, .55); }
+     .track > div, .toast { transition: none; animation: none; }
+     .track.running > div { animation: none; }
+ }
++
++/* ------------------------------------------------------- Filtros/paginação */
++.filters {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 10px;
++    align-items: center;
++    margin: 4px 0 18px;
++    padding-bottom: 18px;
++    border-bottom: 1px solid var(--line);
++}
++.filters input[type=text] { flex: 1 1 260px; width: auto; }
++.filters select { width: auto; flex: 0 0 auto; }
++.btn-link {
++    display: inline-block;
++    padding: 9px 12px;
++    border-radius: var(--radius-sm);
++    font-size: 13.5px;
++    font-weight: 600;
++    text-decoration: none;
++    color: var(--text);
++    border: 1px solid var(--line-strong);
++}
++.btn-link:hover { background: #f1f4f8; }
++.pager { display: flex; align-items: center; gap: 14px; margin-top: 18px; font-size: 14px; }
+-- 
+2.43.0
+

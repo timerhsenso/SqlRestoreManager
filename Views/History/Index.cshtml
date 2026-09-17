@@ -1,9 +1,64 @@
-@model IEnumerable<RestoreHistory>
+@model HistoryViewModel
 @{
     ViewData["Title"] = "Histórico";
 }
+@functions {
+    static string BadgeClass(string status) => status switch
+    {
+        RestoreStatus.Success => "badge-ok",
+        RestoreStatus.Warning => "badge-warn",
+        RestoreStatus.Error or RestoreStatus.Interrupted or RestoreStatus.Canceled => "badge-error",
+        _ => "badge-active"
+    };
+}
 <section class="card wide">
     <h1>Histórico de restores</h1>
+    <p class="card-lead">
+        @if (Model.Total == 0)
+        {
+            <text>Nenhum registro encontrado com esse filtro.</text>
+        }
+        else
+        {
+            <text>Mostrando @Model.FirstRow–@Model.LastRow de @Model.Total registro(s).</text>
+        }
+    </p>
+
+    <form method="get" class="filters">
+        <input type="text" name="q" value="@Model.Query" placeholder="Arquivo, banco de origem ou destino" />
+        <select name="status">
+            @foreach (var (value, label) in HistoryViewModel.StatusFilters)
+            {
+                if (value == (Model.Status ?? string.Empty))
+                {
+                    <option value="@value" selected>@label</option>
+                }
+                else
+                {
+                    <option value="@value">@label</option>
+                }
+            }
+        </select>
+        <select name="pageSize">
+            @foreach (var size in new[] { 25, 50, 100, 200 })
+            {
+                if (size == Model.PageSize)
+                {
+                    <option value="@size" selected>@size por página</option>
+                }
+                else
+                {
+                    <option value="@size">@size por página</option>
+                }
+            }
+        </select>
+        <button type="submit">Filtrar</button>
+        <a asp-action="Index" class="btn-link">Limpar</a>
+        <a asp-action="Export" asp-route-q="@Model.Query" asp-route-status="@Model.Status" class="btn-link">
+            Exportar CSV
+        </a>
+    </form>
+
     <div class="table-scroll">
         <table>
             <thead>
@@ -15,43 +70,136 @@
                     <th>Backup de</th>
                     <th>Status</th>
                     <th>Progresso</th>
-                    <th>Conexões encerradas</th>
+                    <th>Conexões</th>
+                    <th>Log (MB)</th>
                     <th>Fim</th>
                     <th>Instância</th>
+                    <th></th>
                 </tr>
             </thead>
             <tbody>
-                @if (!Model.Any())
+                @if (Model.Items.Count == 0)
                 {
-                    <tr><td colspan="10">Nenhum restore executado ainda.</td></tr>
+                    <tr><td colspan="12" class="muted">Nada para mostrar.</td></tr>
                 }
-                @foreach (var x in Model)
+                @foreach (var x in Model.Items)
                 {
-                    var statusClass = RestoreStatus.IsActive(x.Status) ? "status-active" : $"status-{x.Status}";
                     <tr>
-                        <td>@x.StartedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
-                        <td>@x.OriginalFileName<div class="muted">@((x.FileSizeBytes / 1024d / 1024d).ToString("N1")) MB</div></td>
-                        <td>@x.SourceDatabase<div class="muted">@x.BackupServerName</div></td>
-                        <td>@x.TargetDatabase</td>
-                        <td>@(x.BackupFinishDate?.ToString("dd/MM/yyyy HH:mm") ?? "-")</td>
+                        <td class="num">@x.StartedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
                         <td>
-                            <span class="status @statusClass">@RestoreStatus.ToLabel(x.Status)</span>
+                            @x.OriginalFileName
+                            <div class="sub">@((x.FileSizeBytes / 1024d / 1024d).ToString("N1")) MB</div>
+                        </td>
+                        <td>
+                            @x.SourceDatabase
+                            <div class="sub">@x.BackupServerName</div>
+                        </td>
+                        <td>@x.TargetDatabase</td>
+                        <td class="num">@(x.BackupFinishDate?.ToString("dd/MM/yyyy HH:mm") ?? "-")</td>
+                        <td>
+                            <span class="badge @BadgeClass(x.Status)">@RestoreStatus.ToLabel(x.Status)</span>
                             @if (RestoreStatus.IsActive(x.Status) && !string.IsNullOrWhiteSpace(x.CurrentStep))
                             {
-                                <div class="muted">@x.CurrentStep</div>
+                                <div class="sub">@x.CurrentStep</div>
                             }
                         </td>
-                        <td>@x.PercentComplete%</td>
-                        <td>@x.DisconnectedSessions</td>
-                        <td>@(x.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss") ?? "-")</td>
+                        <td class="num">@x.PercentComplete%</td>
+                        <td class="num">@x.DisconnectedSessions</td>
+                        <td class="num">
+                            @if (x.LogSizeBeforeMB is not null || x.LogSizeAfterMB is not null)
+                            {
+                                <text>@(x.LogSizeBeforeMB?.ToString("N0") ?? "?") → @(x.LogSizeAfterMB?.ToString("N0") ?? "?")</text>
+                            }
+                            else
+                            {
+                                <text>-</text>
+                            }
+                        </td>
+                        <td class="num">@(x.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss") ?? "-")</td>
                         <td>@(x.NodeName ?? "-")</td>
+                        <td>
+                            @if (RestoreStatus.IsActive(x.Status) &&
+                                 string.Equals(x.NodeName, Model.NodeName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                <button type="button" class="btn-ghost btn-small js-cancel"
+                                        data-job="@x.JobId" data-db="@x.TargetDatabase">Cancelar</button>
+                            }
+                        </td>
                     </tr>
                     if (!string.IsNullOrWhiteSpace(x.ErrorMessage))
                     {
-                        <tr><td colspan="10" class="error">@x.ErrorMessage</td></tr>
+                        <tr><td colspan="12"><div class="alert alert-error">@x.ErrorMessage</div></td></tr>
+                    }
+                    if (!string.IsNullOrWhiteSpace(x.SafetyBackupPath))
+                    {
+                        <tr><td colspan="12"><div class="sub">Backup de segurança: @x.SafetyBackupPath</div></td></tr>
+                    }
+                    if (!string.IsNullOrWhiteSpace(x.PostRestoreLog))
+                    {
+                        <tr>
+                            <td colspan="12">
+                                <details open="@(x.Status == RestoreStatus.Warning ? "open" : null)">
+                                    <summary>Pós-restore</summary>
+                                    <pre class="log">@x.PostRestoreLog</pre>
+                                </details>
+                            </td>
+                        </tr>
                     }
                 }
             </tbody>
         </table>
     </div>
+
+    @if (Model.TotalPages > 1)
+    {
+        <div class="pager">
+            @if (Model.HasPrevious)
+            {
+                <a class="btn-link" asp-action="Index" asp-route-q="@Model.Query" asp-route-status="@Model.Status"
+                   asp-route-pageSize="@Model.PageSize" asp-route-page="@(Model.Page - 1)">Anterior</a>
+            }
+            <span class="muted">Página @Model.Page de @Model.TotalPages</span>
+            @if (Model.HasNext)
+            {
+                <a class="btn-link" asp-action="Index" asp-route-q="@Model.Query" asp-route-status="@Model.Status"
+                   asp-route-pageSize="@Model.PageSize" asp-route-page="@(Model.Page + 1)">Próxima</a>
+            }
+        </div>
+    }
 </section>
+
+@section Scripts {
+<script>
+(() => {
+    "use strict";
+    const cancelUrl = "@Url.Action("Cancel", "Restore")";
+
+    for (const button of document.querySelectorAll(".js-cancel")) {
+        button.addEventListener("click", async () => {
+            const confirmed = await ui.confirm({
+                title: `Cancelar o restore de ${button.dataset.db}?`,
+                message: "Se a gravação já tiver começado, o banco ficará em estado RESTORING "
+                       + "e precisará de um novo restore.",
+                confirmText: "Cancelar restore",
+                cancelText: "Voltar",
+                danger: true
+            });
+            if (!confirmed) return;
+
+            button.disabled = true;
+            try {
+                const response = await fetch(`${cancelUrl}?jobId=${encodeURIComponent(button.dataset.job)}`,
+                                             { method: "POST" });
+                const text = await response.text();
+                ui.toast(text, { type: response.ok ? "warn" : "error" });
+                if (response.ok) setTimeout(() => location.reload(), 2500);
+                else button.disabled = false;
+            } catch (err) {
+                ui.toast(err.message, { type: "error" });
+                button.disabled = false;
+            }
+        });
+    }
+})();
+</script>
+}

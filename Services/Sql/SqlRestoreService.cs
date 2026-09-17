@@ -1,5 +1,4 @@
 using System.Data;
-using System.IO.Compression;
 using System.Text;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
@@ -38,7 +37,7 @@ public sealed class SqlRestoreService
     public async Task<IReadOnlyList<SqlSessionInfo>> GetSessionsAsync(
         string database, CancellationToken ct = default)
     {
-        var db = await _catalog.ResolveAsync(database, ct);
+        var db = await _catalog.EnsureRestorableAsync(database, ct);
         await using var cn = await _connections.OpenMasterAsync(ct);
         return await QuerySessionsAsync(cn, db, ct);
     }
@@ -67,51 +66,6 @@ public sealed class SqlRestoreService
         return result;
     }
 
-    // ------------------------------------------------------------ Preparação
-
-    /// <summary>
-    /// Retorna o caminho local do .bak. Se for .zip, extrai o único .bak e remove o zip.
-    /// Método síncrono (I/O pesado): chame via Task.Run.
-    /// </summary>
-    public string PrepareBackup(string uploadedPath, string jobFolder)
-    {
-        var ext = Path.GetExtension(uploadedPath).ToLowerInvariant();
-
-        if (ext == ".bak")
-            return uploadedPath;
-
-        if (ext != ".zip")
-            throw new RestoreValidationException("Somente arquivos .bak ou .zip são permitidos.");
-
-        var extractFolder = Path.Combine(jobFolder, "extract");
-        Directory.CreateDirectory(extractFolder);
-
-        // Nome fixo: nada do ZIP é usado como caminho (proteção contra Zip Slip).
-        var output = Path.Combine(extractFolder, "backup.bak");
-
-        using (var archive = ZipFile.OpenRead(uploadedPath))
-        {
-            var entries = archive.Entries
-                .Where(e => !string.IsNullOrEmpty(e.Name) &&
-                            string.Equals(Path.GetExtension(e.Name), ".bak", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            if (entries.Count != 1)
-                throw new RestoreValidationException(
-                    $"O ZIP deve conter exatamente um arquivo .bak (encontrados: {entries.Count}).");
-
-            var entry = entries[0];
-            if (entry.Length > _options.MaxExtractedBytes)
-                throw new RestoreValidationException(
-                    $"O .bak descompactado excede o limite de {_options.MaxExtractedGB} GB.");
-
-            entry.ExtractToFile(output, overwrite: true);
-        }
-
-        TryDeleteFile(uploadedPath);
-        return output;
-    }
-
     // ------------------------------------------------------------- Inspeção
 
     public async Task<BackupInspection> InspectBackupAsync(
@@ -120,7 +74,8 @@ public sealed class SqlRestoreService
         await using var cn = await _connections.OpenMasterAsync(ct);
         var serverMajor = await GetServerMajorVersionAsync(cn, ct);
 
-        var sets = new List<(int Position, int Type, string Database, DateTime? Finish, string? Server, int Major)>();
+        var sets = new List<(int Position, int Type, string Database, DateTime? Finish, string? Server, int Major,
+            bool HasChecksums)>();
 
         await using (var header = CreateCommand(cn, "RESTORE HEADERONLY FROM DISK = @bak;", ShortTimeoutSeconds))
         {
@@ -135,7 +90,8 @@ public sealed class SqlRestoreService
                     rd["DatabaseName"] as string ?? string.Empty,
                     rd["BackupFinishDate"] as DateTime?,
                     rd["ServerName"] as string,
-                    Convert.ToInt32(rd["SoftwareVersionMajor"])));
+                    Convert.ToInt32(rd["SoftwareVersionMajor"]),
+                    rd["HasBackupChecksums"] is bool hasChecksums && hasChecksums));
             }
         }
 
@@ -176,7 +132,12 @@ public sealed class SqlRestoreService
         if (files.Count == 0)
             throw new RestoreValidationException("Nenhum arquivo lógico encontrado no backup.");
 
-        return new BackupInspection(full.Database, full.Position, full.Finish, full.Server, full.Major, files);
+        if (!full.HasChecksums)
+            _logger.LogInformation(
+                "Backup gerado sem CHECKSUM: a verificação de integridade será feita sem essa opção.");
+
+        return new BackupInspection(
+            full.Database, full.Position, full.Finish, full.Server, full.Major, full.HasChecksums, files);
     }
 
     // --------------------------------------------------------------- Restore
@@ -192,7 +153,7 @@ public sealed class SqlRestoreService
         CancellationToken ct = default)
     {
         // Revalida no momento do restore (o banco pode ter sido bloqueado/removido após o upload).
-        var db = await _catalog.ResolveAsync(request.TargetDatabase, ct);
+        var db = await _catalog.EnsureRestorableAsync(request.TargetDatabase, ct);
 
         await using var cn = await _connections.OpenMasterAsync(ct);
         onSessionStarted(await GetSessionIdAsync(cn, ct));
@@ -238,6 +199,105 @@ public sealed class SqlRestoreService
         return new RestoreResult(sessions, dataPath, logPath);
     }
 
+    public async Task<bool> DatabaseExistsAsync(string database, CancellationToken ct = default)
+    {
+        await using var cn = await _connections.OpenMasterAsync(ct);
+        return await GetDatabaseStateAsync(cn, database, ct) is not null;
+    }
+
+    /// <summary>RESTORE VERIFYONLY: confere se o backup é legível e íntegro.</summary>
+    public async Task VerifyBackupAsync(
+        string sqlServerBackupPath,
+        int position,
+        bool hasChecksums,
+        Action<int> onSessionStarted,
+        CancellationToken ct = default)
+    {
+        await using var cn = await _connections.OpenMasterAsync(ct);
+        onSessionStarted(await GetSessionIdAsync(cn, ct));
+
+        // CHECKSUM só é aceito quando o backup foi gerado com essa opção.
+        var options = hasChecksums ? "FILE = @pos, CHECKSUM, STATS = 5" : "FILE = @pos, STATS = 5";
+
+        await using var cmd = cn.CreateCommand();
+        cmd.CommandText = $"RESTORE VERIFYONLY FROM DISK = @bak WITH {options};";
+        cmd.CommandTimeout = 0;
+        AddPathParameter(cmd, "@bak", sqlServerBackupPath);
+        cmd.Parameters.Add("@pos", SqlDbType.Int).Value = position;
+
+        _logger.LogInformation("Verificando backup {Backup} (FILE={Position}).", sqlServerBackupPath, position);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// BACKUP ... WITH COPY_ONLY do banco atual, para poder voltar atrás.
+    /// Retorna o caminho gerado (visto pelo SQL Server).
+    /// </summary>
+    public async Task<string> CreateSafetyBackupAsync(
+        string database, string folder, Action<int> onSessionStarted, CancellationToken ct = default)
+    {
+        var db = await _catalog.EnsureRestorableAsync(database, ct);
+        var fileName = $"{db}_pre_restore_{DateTime.Now:yyyyMMdd_HHmmss}.bak";
+        var path = CombineServerPath(folder, fileName);
+
+        await using var cn = await _connections.OpenMasterAsync(ct);
+        onSessionStarted(await GetSessionIdAsync(cn, ct));
+
+        _logger.LogInformation("Backup de segurança de {Database} em {Path}.", db, path);
+
+        try
+        {
+            await ExecuteBackupAsync(cn, db, path, _options.PreRestore.SafetyBackupCompression, ct);
+        }
+        catch (SqlException ex) when (_options.PreRestore.SafetyBackupCompression)
+        {
+            // Edições sem suporte a compressão (ex.: Express): repete sem COMPRESSION.
+            _logger.LogWarning(ex, "Backup com COMPRESSION falhou; repetindo sem compressão.");
+            await ExecuteBackupAsync(cn, db, path, compression: false, ct);
+        }
+
+        return path;
+    }
+
+    /// <summary>Remove backups de segurança antigos (xp_delete_file).</summary>
+    public async Task CleanupSafetyBackupsAsync(string folder, int retentionDays, CancellationToken ct = default)
+    {
+        if (retentionDays <= 0)
+            return;
+
+        await using var cn = await _connections.OpenMasterAsync(ct);
+        await using var cmd = CreateCommand(cn, """
+            EXEC master.dbo.xp_delete_file 0, @folder, N'BAK', @cutoff, 0;
+            """, ShortTimeoutSeconds);
+        AddPathParameter(cmd, "@folder", folder.TrimEnd('\\', '/') + "\\");
+        cmd.Parameters.Add("@cutoff", SqlDbType.DateTime).Value = DateTime.Now.AddDays(-retentionDays);
+
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Encerra uma sessão (usado no cancelamento).</summary>
+    public async Task KillSessionAsync(int sessionId, CancellationToken ct = default)
+    {
+        await using var cn = await _connections.OpenMasterAsync(ct);
+        // Valor inteiro: sem risco de injeção.
+        await using var cmd = CreateCommand(cn, $"KILL {sessionId};", ShortTimeoutSeconds);
+        await cmd.ExecuteNonQueryAsync(ct);
+        _logger.LogWarning("Sessão {Spid} encerrada (KILL).", sessionId);
+    }
+
+    private static async Task ExecuteBackupAsync(
+        SqlConnection cn, string database, string path, bool compression, CancellationToken ct)
+    {
+        var options = compression ? "COPY_ONLY, COMPRESSION, CHECKSUM, STATS = 5" : "COPY_ONLY, CHECKSUM, STATS = 5";
+
+        await using var cmd = cn.CreateCommand();
+        cmd.CommandText = $"BACKUP DATABASE @db TO DISK = @path WITH {options};";
+        cmd.CommandTimeout = 0;
+        AddDatabaseParameter(cmd, database);
+        AddPathParameter(cmd, "@path", path);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task<double?> GetRestorePercentAsync(int sessionId, CancellationToken ct = default)
     {
         await using var cn = await _connections.OpenMasterAsync(ct);
@@ -245,7 +305,7 @@ public sealed class SqlRestoreService
             SELECT TOP (1) CAST(r.percent_complete AS float)
             FROM sys.dm_exec_requests AS r
             WHERE r.session_id = @spid
-              AND r.command LIKE N'RESTORE%';
+              AND (r.command LIKE N'RESTORE%' OR r.command LIKE N'BACKUP%');
             """, 30);
         cmd.Parameters.Add("@spid", SqlDbType.Int).Value = sessionId;
 
@@ -454,16 +514,4 @@ public sealed class SqlRestoreService
 
     private static string? FirstNonEmpty(params string?[] values) =>
         values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
-
-    private void TryDeleteFile(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Não foi possível remover {Path}.", path);
-        }
-    }
 }

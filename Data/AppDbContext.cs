@@ -27,6 +27,8 @@ public class AppDbContext : DbContext
             e.Property(x => x.BackupServerName).HasMaxLength(128);
             e.Property(x => x.NodeName).HasMaxLength(128);
             e.Property(x => x.ErrorMessage).HasMaxLength(4000);
+            e.Property(x => x.PostRestoreLog).HasColumnType("nvarchar(max)");
+            e.Property(x => x.SafetyBackupPath).HasMaxLength(512);
             e.Property(x => x.StartedAt).HasColumnType("datetime2");
             e.Property(x => x.FinishedAt).HasColumnType("datetime2");
             e.Property(x => x.BackupFinishDate).HasColumnType("datetime2");

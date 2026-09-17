@@ -21,6 +21,10 @@ public class RestoreHistory
     public DateTime? BackupFinishDate { get; set; }
     public string? BackupServerName { get; set; }
     public string? NodeName { get; set; }
+    public int? LogSizeBeforeMB { get; set; }
+    public int? LogSizeAfterMB { get; set; }
+    public string? PostRestoreLog { get; set; }
+    public string? SafetyBackupPath { get; set; }
     public DateTime StartedAt { get; set; }
     public DateTime? FinishedAt { get; set; }
     public string? ErrorMessage { get; set; }

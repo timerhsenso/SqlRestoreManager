@@ -41,6 +41,39 @@ public sealed partial class RestoreOptionsValidator : IValidateOptions<RestoreOp
                 errors.Add($"Restore:BlockedDatabases contém padrão inválido: '{pattern}'.");
         }
 
+        if (!string.IsNullOrWhiteSpace(o.LibraryPath) && !Path.IsPathFullyQualified(o.LibraryPath))
+            errors.Add("Restore:LibraryPath deve ser um caminho absoluto (local ou UNC).");
+
+        ValidateServerPath(o.SqlServerLibraryPath, "Restore:SqlServerLibraryPath", errors);
+
+        if (!string.IsNullOrWhiteSpace(o.SqlServerLibraryPath) && string.IsNullOrWhiteSpace(o.LibraryPath))
+            errors.Add("Restore:SqlServerLibraryPath exige Restore:LibraryPath.");
+
+        if (!string.IsNullOrWhiteSpace(o.SevenZipPath) && !Path.IsPathFullyQualified(o.SevenZipPath))
+            errors.Add("Restore:SevenZipPath deve ser o caminho absoluto do 7z.exe.");
+
+        var pre = o.PreRestore;
+        if (pre.SafetyBackup && string.IsNullOrWhiteSpace(pre.SafetyBackupPath))
+            errors.Add("Restore:PreRestore:SafetyBackup exige Restore:PreRestore:SafetyBackupPath.");
+
+        ValidateServerPath(pre.SafetyBackupPath, "Restore:PreRestore:SafetyBackupPath", errors);
+
+        if (pre.SafetyBackupRetentionDays is < 0 or > 3650)
+            errors.Add("Restore:PreRestore:SafetyBackupRetentionDays deve estar entre 0 e 3650.");
+
+        var post = o.PostRestore;
+        if (post.LogTargetSizeMB is < 1 or > 1_048_576)
+            errors.Add("Restore:PostRestore:LogTargetSizeMB deve estar entre 1 e 1048576.");
+
+        if (post.LogGrowthMB is < 0 or > 10_240)
+            errors.Add("Restore:PostRestore:LogGrowthMB deve estar entre 0 e 10240.");
+
+        if (post.CommandTimeoutMinutes is < 1 or > 1440)
+            errors.Add("Restore:PostRestore:CommandTimeoutMinutes deve estar entre 1 e 1440.");
+
+        if (!string.IsNullOrWhiteSpace(post.ScriptsPath) && !Path.IsPathFullyQualified(post.ScriptsPath))
+            errors.Add("Restore:PostRestore:ScriptsPath deve ser um caminho absoluto.");
+
         return errors.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(errors);
     }
 

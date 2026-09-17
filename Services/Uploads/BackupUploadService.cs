@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Primitives;
@@ -23,14 +24,16 @@ public sealed class BackupUploadService
 {
     private const int BufferSize = 1024 * 1024;
     private const int MaxFileNameLength = 260;
-    private static readonly string[] AllowedExtensions = [".bak", ".zip"];
 
     private readonly RestoreOptions _options;
+    private readonly BackupExtractor _extractor;
     private readonly ILogger<BackupUploadService> _logger;
 
-    public BackupUploadService(IOptions<RestoreOptions> options, ILogger<BackupUploadService> logger)
+    public BackupUploadService(
+        IOptions<RestoreOptions> options, BackupExtractor extractor, ILogger<BackupUploadService> logger)
     {
         _options = options.Value;
+        _extractor = extractor;
         _logger = logger;
     }
 
@@ -72,11 +75,21 @@ public sealed class BackupUploadService
                 var originalName = Path.GetFileName(rawName ?? string.Empty);
                 var extension = Path.GetExtension(originalName).ToLowerInvariant();
 
-                if (!AllowedExtensions.Contains(extension))
-                    throw new RestoreValidationException("Somente arquivos .bak ou .zip são permitidos.");
+                if (!_extractor.IsAllowed(originalName))
+                    throw new RestoreValidationException(
+                        $"Extensão não suportada. Permitidas: {string.Join(", ", _extractor.AllowedExtensions)}.");
 
                 var path = Path.Combine(folder, "upload" + extension);
-                var size = await CopyWithLimitAsync(section.Body, path, _options.MaxUploadBytes, ct);
+                _logger.LogInformation("Job {JobId}: recebendo '{File}' em {Path}.", jobId, originalName, path);
+
+                var stopwatch = Stopwatch.StartNew();
+                var size = await CopyWithLimitAsync(section.Body, path, _options.MaxUploadBytes, jobId, ct);
+                stopwatch.Stop();
+
+                _logger.LogInformation(
+                    "Job {JobId}: arquivo gravado ({SizeMB:N1} MB em {Seconds:N1}s, {Rate:N1} MB/s).",
+                    jobId, size / 1024d / 1024d, stopwatch.Elapsed.TotalSeconds,
+                    size / 1024d / 1024d / Math.Max(stopwatch.Elapsed.TotalSeconds, 0.001));
 
                 if (size == 0)
                     throw new RestoreValidationException("O arquivo enviado está vazio.");
@@ -96,8 +109,10 @@ public sealed class BackupUploadService
         }
     }
 
-    private static async Task<long> CopyWithLimitAsync(Stream source, string path, long maxBytes, CancellationToken ct)
+    private async Task<long> CopyWithLimitAsync(
+        Stream source, string path, long maxBytes, Guid jobId, CancellationToken ct)
     {
+        const long logEveryBytes = 100L * 1024 * 1024;
         var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
         try
         {
@@ -111,6 +126,7 @@ public sealed class BackupUploadService
             });
 
             long total = 0;
+            long nextLog = logEveryBytes;
             int read;
             while ((read = await source.ReadAsync(buffer.AsMemory(0, BufferSize), ct)) > 0)
             {
@@ -121,7 +137,16 @@ public sealed class BackupUploadService
                         StatusCodes.Status413PayloadTooLarge);
 
                 await target.WriteAsync(buffer.AsMemory(0, read), ct);
+
+                if (total >= nextLog)
+                {
+                    _logger.LogInformation("Job {JobId}: {SizeMB:N0} MB gravados...", jobId, total / 1024d / 1024d);
+                    nextLog += logEveryBytes;
+                }
             }
+
+            _logger.LogDebug("Job {JobId}: finalizando gravação em disco...", jobId);
+            await target.FlushAsync(ct);
 
             return total;
         }

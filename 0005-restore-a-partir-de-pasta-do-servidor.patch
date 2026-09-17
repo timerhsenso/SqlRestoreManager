@@ -1,0 +1,947 @@
+From 89db2c18f1123723eaac6eac4ad6754e0043a69e Mon Sep 17 00:00:00 2001
+From: claude <c@x>
+Date: Thu, 17 Sep 2026 17:35:54 +0000
+Subject: [PATCH] Fase 4: restaurar a partir de pasta do servidor, com suporte
+ a rar/7z
+
+---
+ Configuration/RestoreOptions.cs          |  12 +++
+ Configuration/RestoreOptionsValidator.cs |  11 ++
+ Controllers/RestoreController.cs         | 106 ++++++++++++++++++-
+ Models/RestoreIndexViewModel.cs          |   3 +
+ Models/RestoreJob.cs                     |  14 ++-
+ Program.cs                               |   2 +
+ README.md                                |  20 ++++
+ Services/Jobs/RestoreJobProcessor.cs     |   5 +-
+ Services/Sql/BackupPathMapper.cs         |  38 +++++--
+ Services/Sql/SqlRestoreService.cs        |  58 -----------
+ Services/Uploads/BackupExtractor.cs      | 126 +++++++++++++++++++++++
+ Services/Uploads/BackupLibrary.cs        |  71 +++++++++++++
+ Services/Uploads/BackupUploadService.cs  |  11 +-
+ Views/Restore/Index.cshtml               | 121 +++++++++++++++++++---
+ wwwroot/css/site.css                     |   3 +
+ 15 files changed, 510 insertions(+), 91 deletions(-)
+ create mode 100644 Services/Uploads/BackupExtractor.cs
+ create mode 100644 Services/Uploads/BackupLibrary.cs
+
+diff --git a/Configuration/RestoreOptions.cs b/Configuration/RestoreOptions.cs
+index f670699..3247829 100644
+--- a/Configuration/RestoreOptions.cs
++++ b/Configuration/RestoreOptions.cs
+@@ -51,6 +51,18 @@ public sealed class RestoreOptions
+     /// </summary>
+     public bool ShowBlockedDatabases { get; set; } = true;
+ 
++    /// <summary>
++    /// Pasta (vista pela aplicação) onde os backups são copiados manualmente, para restaurar
++    /// sem upload. Vazio = recurso desligado.
++    /// </summary>
++    public string? LibraryPath { get; set; }
++
++    /// <summary>Mesma pasta de <see cref="LibraryPath"/>, como o SQL Server a enxerga.</summary>
++    public string? SqlServerLibraryPath { get; set; }
++
++    /// <summary>Caminho do 7z.exe no servidor da aplicação. Habilita .rar e .7z.</summary>
++    public string? SevenZipPath { get; set; }
++
+     /// <summary>Ajustes automáticos após o restore.</summary>
+     public PostRestoreOptions PostRestore { get; set; } = new();
+ 
+diff --git a/Configuration/RestoreOptionsValidator.cs b/Configuration/RestoreOptionsValidator.cs
+index 4248e1c..3c8c2ca 100644
+--- a/Configuration/RestoreOptionsValidator.cs
++++ b/Configuration/RestoreOptionsValidator.cs
+@@ -41,6 +41,17 @@ public sealed partial class RestoreOptionsValidator : IValidateOptions<RestoreOp
+                 errors.Add($"Restore:BlockedDatabases contém padrão inválido: '{pattern}'.");
+         }
+ 
++        if (!string.IsNullOrWhiteSpace(o.LibraryPath) && !Path.IsPathFullyQualified(o.LibraryPath))
++            errors.Add("Restore:LibraryPath deve ser um caminho absoluto (local ou UNC).");
++
++        ValidateServerPath(o.SqlServerLibraryPath, "Restore:SqlServerLibraryPath", errors);
++
++        if (!string.IsNullOrWhiteSpace(o.SqlServerLibraryPath) && string.IsNullOrWhiteSpace(o.LibraryPath))
++            errors.Add("Restore:SqlServerLibraryPath exige Restore:LibraryPath.");
++
++        if (!string.IsNullOrWhiteSpace(o.SevenZipPath) && !Path.IsPathFullyQualified(o.SevenZipPath))
++            errors.Add("Restore:SevenZipPath deve ser o caminho absoluto do 7z.exe.");
++
+         var post = o.PostRestore;
+         if (post.LogTargetSizeMB is < 1 or > 1_048_576)
+             errors.Add("Restore:PostRestore:LogTargetSizeMB deve estar entre 1 e 1048576.");
+diff --git a/Controllers/RestoreController.cs b/Controllers/RestoreController.cs
+index 0e2dec2..0e50fbd 100644
+--- a/Controllers/RestoreController.cs
++++ b/Controllers/RestoreController.cs
+@@ -22,6 +22,8 @@ public sealed class RestoreController : Controller
+     private readonly AppDbContext _db;
+     private readonly SqlRestoreService _sql;
+     private readonly BackupUploadService _uploads;
++    private readonly BackupLibrary _library;
++    private readonly BackupExtractor _extractor;
+     private readonly RestoreOptions _options;
+     private readonly ILogger<RestoreController> _logger;
+ 
+@@ -31,6 +33,8 @@ public sealed class RestoreController : Controller
+         AppDbContext db,
+         SqlRestoreService sql,
+         BackupUploadService uploads,
++        BackupLibrary library,
++        BackupExtractor extractor,
+         IOptions<RestoreOptions> options,
+         ILogger<RestoreController> logger)
+     {
+@@ -39,6 +43,8 @@ public sealed class RestoreController : Controller
+         _db = db;
+         _sql = sql;
+         _uploads = uploads;
++        _library = library;
++        _extractor = extractor;
+         _options = options.Value;
+         _logger = logger;
+     }
+@@ -49,7 +55,13 @@ public sealed class RestoreController : Controller
+         try
+         {
+             var databases = await _catalog.ListAsync(ct);
+-            return View(new RestoreIndexViewModel { Databases = databases, MaxUploadMB = _options.MaxUploadMB });
++            return View(new RestoreIndexViewModel
++            {
++                Databases = databases,
++                MaxUploadMB = _options.MaxUploadMB,
++                LibraryEnabled = _library.Enabled,
++                AllowedExtensions = _extractor.AllowedExtensions
++            });
+         }
+         catch (Exception ex) when (!ct.IsCancellationRequested)
+         {
+@@ -57,6 +69,8 @@ public sealed class RestoreController : Controller
+             return View(new RestoreIndexViewModel
+             {
+                 MaxUploadMB = _options.MaxUploadMB,
++                LibraryEnabled = _library.Enabled,
++                AllowedExtensions = _extractor.AllowedExtensions,
+                 LoadError = SqlErrorTranslator.Translate(ex)
+             });
+         }
+@@ -76,6 +90,93 @@ public sealed class RestoreController : Controller
+         }
+     }
+ 
++    /// <summary>Arquivos disponíveis na pasta de backups do servidor.</summary>
++    [HttpGet]
++    public IActionResult Files()
++    {
++        try
++        {
++            return Json(_library.List().Select(f => new
++            {
++                name = f.Name,
++                sizeMB = Math.Round(f.SizeMB, 1),
++                modifiedAt = f.ModifiedAt.ToString("dd/MM/yyyy HH:mm")
++            }));
++        }
++        catch (RestoreValidationException ex)
++        {
++            return StatusCode(ex.StatusCode, ex.Message);
++        }
++    }
++
++    /// <summary>Restaura um arquivo que já está na pasta do servidor (sem upload).</summary>
++    [HttpPost]
++    public async Task<IActionResult> StartFromFile(string? targetDatabase, string? fileName, CancellationToken ct)
++    {
++        string database;
++        FileInfo file;
++        try
++        {
++            database = await _catalog.ResolveAsync(targetDatabase, ct);
++            file = _library.Resolve(fileName);
++        }
++        catch (RestoreValidationException ex)
++        {
++            return StatusCode(ex.StatusCode, ex.Message);
++        }
++        catch (Exception ex) when (!ct.IsCancellationRequested)
++        {
++            _logger.LogError(ex, "Falha ao validar o restore a partir da pasta.");
++            return StatusCode(StatusCodes.Status503ServiceUnavailable, SqlErrorTranslator.Translate(ex));
++        }
++
++        var jobId = Guid.NewGuid();
++        if (!_queue.TryReserve(database, jobId))
++            return Conflict($"Já existe um restore na fila ou em andamento para '{database}'.");
++
++        var enqueued = false;
++        try
++        {
++            // Pasta só para extração: o arquivo original da pasta de backups não é tocado.
++            var jobFolder = _uploads.GetJobFolder(jobId);
++            Directory.CreateDirectory(jobFolder);
++
++            var history = new RestoreHistory
++            {
++                JobId = jobId,
++                OriginalFileName = file.Name,
++                TargetDatabase = database,
++                FileSizeBytes = file.Length,
++                Status = RestoreStatus.Queued,
++                CurrentStep = "Na fila de restore.",
++                PercentComplete = 0,
++                NodeName = _options.EffectiveNodeName,
++                StartedAt = DateTime.Now
++            };
++
++            _db.RestoreHistory.Add(history);
++            await _db.SaveChangesAsync(CancellationToken.None);
++
++            await _queue.EnqueueAsync(new RestoreJob(
++                jobId, RestoreSource.Library, file.FullName, jobFolder, file.Name, database, file.Length),
++                CancellationToken.None);
++            enqueued = true;
++
++            _logger.LogInformation(
++                "Job {JobId} enfileirado a partir da pasta: {File} → {Database}.", jobId, file.Name, database);
++
++            return Json(new { jobId });
++        }
++        finally
++        {
++            if (!enqueued)
++            {
++                _queue.Release(database, jobId);
++                TempFolder.TryDelete(_uploads.GetJobFolder(jobId), _logger);
++            }
++        }
++    }
++
+     [HttpGet]
+     public async Task<IActionResult> Status(Guid jobId, CancellationToken ct)
+     {
+@@ -146,7 +247,8 @@ public sealed class RestoreController : Controller
+             await _db.SaveChangesAsync(CancellationToken.None);
+ 
+             await _queue.EnqueueAsync(new RestoreJob(
+-                jobId, upload.FilePath, upload.JobFolder, upload.OriginalFileName, database, upload.SizeBytes),
++                jobId, RestoreSource.Upload, upload.FilePath, upload.JobFolder,
++                upload.OriginalFileName, database, upload.SizeBytes),
+                 CancellationToken.None);
+             enqueued = true;
+ 
+diff --git a/Models/RestoreIndexViewModel.cs b/Models/RestoreIndexViewModel.cs
+index 236774f..7f40dfb 100644
+--- a/Models/RestoreIndexViewModel.cs
++++ b/Models/RestoreIndexViewModel.cs
+@@ -1,4 +1,5 @@
+ using SqlRestoreManager.Services.Sql;
++using SqlRestoreManager.Services.Uploads;
+ 
+ namespace SqlRestoreManager.Models;
+ 
+@@ -6,5 +7,7 @@ public sealed class RestoreIndexViewModel
+ {
+     public IReadOnlyList<DatabaseInfo> Databases { get; init; } = [];
+     public int MaxUploadMB { get; init; }
++    public bool LibraryEnabled { get; init; }
++    public IReadOnlyList<string> AllowedExtensions { get; init; } = [];
+     public string? LoadError { get; init; }
+ }
+diff --git a/Models/RestoreJob.cs b/Models/RestoreJob.cs
+index 230a889..b7c286d 100644
+--- a/Models/RestoreJob.cs
++++ b/Models/RestoreJob.cs
+@@ -1,9 +1,21 @@
+ namespace SqlRestoreManager.Models;
+ 
++public enum RestoreSource
++{
++    /// <summary>Arquivo enviado pelo navegador (fica dentro da pasta do job).</summary>
++    Upload,
++
++    /// <summary>Arquivo já presente na pasta de backups do servidor (não é removido).</summary>
++    Library
++}
++
+ /// <summary>Item da fila em memória processado pelo RestoreWorker.</summary>
++/// <param name="SourcePath">Caminho local do .bak/.zip/.rar/.7z.</param>
++/// <param name="JobFolder">Pasta temporária do job (extração e, no upload, o próprio arquivo).</param>
+ public sealed record RestoreJob(
+     Guid JobId,
+-    string UploadedPath,
++    RestoreSource Source,
++    string SourcePath,
+     string JobFolder,
+     string OriginalFileName,
+     string TargetDatabase,
+diff --git a/Program.cs b/Program.cs
+index 1fbf40e..7ed7db8 100644
+--- a/Program.cs
++++ b/Program.cs
+@@ -43,6 +43,8 @@ builder.Services.AddSingleton<DatabaseCatalog>();
+ builder.Services.AddSingleton<BackupPathMapper>();
+ builder.Services.AddSingleton<SqlRestoreService>();
+ builder.Services.AddSingleton<PostRestoreService>();
++builder.Services.AddSingleton<BackupExtractor>();
++builder.Services.AddSingleton<BackupLibrary>();
+ builder.Services.AddSingleton<BackupUploadService>();
+ builder.Services.AddSingleton<RestoreNotifier>();
+ builder.Services.AddSingleton<RestoreQueue>();
+diff --git a/README.md b/README.md
+index 511311c..8726b57 100644
+--- a/README.md
++++ b/README.md
+@@ -32,6 +32,9 @@ Aplicação ASP.NET Core 8 MVC para restaurar bancos SQL Server pelo navegador
+ | `SqlServerTempPath` | A mesma pasta vista **pelo SQL Server**. Vazio = igual a `TempPath`. |
+ | `DataPath` / `LogPath` | Pastas de .mdf/.ldf **no servidor SQL**. Vazio = padrão da instância. |
+ | `MaxUploadMB` | Limite de upload (1–4000; o IIS não aceita mais que ~4 GB). |
++| `LibraryPath` | Pasta (vista pela aplicação) com backups copiados manualmente. Vazio = recurso desligado. |
++| `SqlServerLibraryPath` | A mesma pasta vista pelo SQL Server. Vazio = igual a `LibraryPath`. |
++| `SevenZipPath` | Caminho do `7z.exe`. Habilita `.rar` e `.7z`. |
+ | `MaxExtractedGB` | Limite do .bak descompactado de um .zip. |
+ | `ProgressPollSeconds` | Intervalo de leitura do progresso. |
+ | `TempRetentionHours` | Idade mínima para limpeza de pastas temporárias órfãs. |
+@@ -43,6 +46,23 @@ A lista de destino vem de `sys.databases` do servidor. Bancos de sistema (`maste
+ 
+ A aplicação **não sobe** se a configuração for inválida (`ValidateOnStart`).
+ 
++## Restaurar sem upload (pasta do servidor)
++
++Copie o backup para `LibraryPath` (por exemplo, uma subpasta do compartilhamento) e escolha
++**Usar arquivo da pasta do servidor** na tela. Não passa pelo limite de ~4 GB do IIS e o arquivo
++original **não é apagado** após o restore.
++
++Formatos: `.bak` e `.zip` sempre; `.rar` e `.7z` quando `SevenZipPath` apontar para um `7z.exe`
++instalado na máquina da aplicação. Compactados devem conter exatamente um `.bak`.
++
++Exemplo:
++
++```json
++"LibraryPath": "\\\\srvhomologacao\\RestoreTemp\\Backups",
++"SqlServerLibraryPath": "C:\\RestoreManager\\Temp\\Backups",
++"SevenZipPath": "C:\\Program Files\\7-Zip\\7z.exe"
++```
++
+ ## Pós-restore (`Restore:PostRestore`)
+ 
+ Executado automaticamente após cada restore bem-sucedido. Falhas viram **alertas** no histórico
+diff --git a/Services/Jobs/RestoreJobProcessor.cs b/Services/Jobs/RestoreJobProcessor.cs
+index 25af0da..ec35a3f 100644
+--- a/Services/Jobs/RestoreJobProcessor.cs
++++ b/Services/Jobs/RestoreJobProcessor.cs
+@@ -22,6 +22,7 @@ public sealed class RestoreJobProcessor
+     private readonly AppDbContext _db;
+     private readonly SqlRestoreService _sql;
+     private readonly PostRestoreService _postRestore;
++    private readonly BackupExtractor _extractor;
+     private readonly BackupPathMapper _pathMapper;
+     private readonly RestoreNotifier _notifier;
+     private readonly RestoreOptions _options;
+@@ -31,6 +32,7 @@ public sealed class RestoreJobProcessor
+         AppDbContext db,
+         SqlRestoreService sql,
+         PostRestoreService postRestore,
++        BackupExtractor extractor,
+         BackupPathMapper pathMapper,
+         RestoreNotifier notifier,
+         IOptions<RestoreOptions> options,
+@@ -39,6 +41,7 @@ public sealed class RestoreJobProcessor
+         _db = db;
+         _sql = sql;
+         _postRestore = postRestore;
++        _extractor = extractor;
+         _pathMapper = pathMapper;
+         _notifier = notifier;
+         _options = options.Value;
+@@ -64,7 +67,7 @@ public sealed class RestoreJobProcessor
+         try
+         {
+             await StepAsync(history, RestoreStatus.Preparing, "Preparando arquivo de backup...", 3, stoppingToken);
+-            var localBackup = await Task.Run(() => _sql.PrepareBackup(job.UploadedPath, job.JobFolder), stoppingToken);
++            var localBackup = await _extractor.PrepareAsync(job.SourcePath, job.JobFolder, stoppingToken);
+             var sqlBackup = _pathMapper.ToSqlServerPath(localBackup);
+ 
+             await StepAsync(history, RestoreStatus.Validating, "Validando backup no SQL Server...", 8, stoppingToken);
+diff --git a/Services/Sql/BackupPathMapper.cs b/Services/Sql/BackupPathMapper.cs
+index 3eb48da..9d1c8a2 100644
+--- a/Services/Sql/BackupPathMapper.cs
++++ b/Services/Sql/BackupPathMapper.cs
+@@ -4,28 +4,44 @@ using SqlRestoreManager.Configuration;
+ namespace SqlRestoreManager.Services.Sql;
+ 
+ /// <summary>
+-/// Converte um caminho gravado pela aplicação (TempPath) para o caminho
+-/// equivalente visto pelo serviço do SQL Server (SqlServerTempPath).
+-/// Necessário quando a aplicação roda em outra máquina (ex.: Visual Studio em dev).
++/// Converte um caminho gravado/lido pela aplicação para o caminho equivalente
++/// visto pelo serviço do SQL Server. Necessário quando a aplicação roda em outra
++/// máquina (ex.: Visual Studio em dev acessando um compartilhamento).
+ /// </summary>
+ public sealed class BackupPathMapper
+ {
+-    private readonly RestoreOptions _options;
++    private readonly (string Local, string Server)[] _mappings;
+ 
+-    public BackupPathMapper(IOptions<RestoreOptions> options) => _options = options.Value;
++    public BackupPathMapper(IOptions<RestoreOptions> options)
++    {
++        var o = options.Value;
++        _mappings = new[]
++            {
++                (o.TempPath, o.SqlServerTempPath),
++                (o.LibraryPath, o.SqlServerLibraryPath)
++            }
++            .Where(m => !string.IsNullOrWhiteSpace(m.Item1) && !string.IsNullOrWhiteSpace(m.Item2))
++            .Select(m => (Local: Path.GetFullPath(m.Item1!), Server: m.Item2!.TrimEnd('\\', '/')))
++            .ToArray();
++    }
+ 
+     public string ToSqlServerPath(string localPath)
+     {
+-        if (string.IsNullOrWhiteSpace(_options.SqlServerTempPath))
++        if (_mappings.Length == 0)
+             return localPath;
+ 
+-        var root = Path.GetFullPath(_options.TempPath);
+         var full = Path.GetFullPath(localPath);
+-        var relative = Path.GetRelativePath(root, full);
+ 
+-        if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+-            throw new InvalidOperationException("O arquivo de backup está fora da pasta temporária configurada.");
++        foreach (var (local, server) in _mappings)
++        {
++            var relative = Path.GetRelativePath(local, full);
++            if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
++                continue;
++
++            return server + "\\" + relative.Replace('/', '\\');
++        }
+ 
+-        return _options.SqlServerTempPath.TrimEnd('\\', '/') + "\\" + relative.Replace('/', '\\');
++        // Caminho fora das pastas mapeadas: o SQL Server precisa enxergá-lo como está.
++        return localPath;
+     }
+ }
+diff --git a/Services/Sql/SqlRestoreService.cs b/Services/Sql/SqlRestoreService.cs
+index 84958d5..a58e94b 100644
+--- a/Services/Sql/SqlRestoreService.cs
++++ b/Services/Sql/SqlRestoreService.cs
+@@ -1,5 +1,4 @@
+ using System.Data;
+-using System.IO.Compression;
+ using System.Text;
+ using Microsoft.Data.SqlClient;
+ using Microsoft.Extensions.Options;
+@@ -67,51 +66,6 @@ public sealed class SqlRestoreService
+         return result;
+     }
+ 
+-    // ------------------------------------------------------------ Preparação
+-
+-    /// <summary>
+-    /// Retorna o caminho local do .bak. Se for .zip, extrai o único .bak e remove o zip.
+-    /// Método síncrono (I/O pesado): chame via Task.Run.
+-    /// </summary>
+-    public string PrepareBackup(string uploadedPath, string jobFolder)
+-    {
+-        var ext = Path.GetExtension(uploadedPath).ToLowerInvariant();
+-
+-        if (ext == ".bak")
+-            return uploadedPath;
+-
+-        if (ext != ".zip")
+-            throw new RestoreValidationException("Somente arquivos .bak ou .zip são permitidos.");
+-
+-        var extractFolder = Path.Combine(jobFolder, "extract");
+-        Directory.CreateDirectory(extractFolder);
+-
+-        // Nome fixo: nada do ZIP é usado como caminho (proteção contra Zip Slip).
+-        var output = Path.Combine(extractFolder, "backup.bak");
+-
+-        using (var archive = ZipFile.OpenRead(uploadedPath))
+-        {
+-            var entries = archive.Entries
+-                .Where(e => !string.IsNullOrEmpty(e.Name) &&
+-                            string.Equals(Path.GetExtension(e.Name), ".bak", StringComparison.OrdinalIgnoreCase))
+-                .ToList();
+-
+-            if (entries.Count != 1)
+-                throw new RestoreValidationException(
+-                    $"O ZIP deve conter exatamente um arquivo .bak (encontrados: {entries.Count}).");
+-
+-            var entry = entries[0];
+-            if (entry.Length > _options.MaxExtractedBytes)
+-                throw new RestoreValidationException(
+-                    $"O .bak descompactado excede o limite de {_options.MaxExtractedGB} GB.");
+-
+-            entry.ExtractToFile(output, overwrite: true);
+-        }
+-
+-        TryDeleteFile(uploadedPath);
+-        return output;
+-    }
+-
+     // ------------------------------------------------------------- Inspeção
+ 
+     public async Task<BackupInspection> InspectBackupAsync(
+@@ -454,16 +408,4 @@ public sealed class SqlRestoreService
+ 
+     private static string? FirstNonEmpty(params string?[] values) =>
+         values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+-
+-    private void TryDeleteFile(string path)
+-    {
+-        try
+-        {
+-            File.Delete(path);
+-        }
+-        catch (Exception ex)
+-        {
+-            _logger.LogWarning(ex, "Não foi possível remover {Path}.", path);
+-        }
+-    }
+ }
+diff --git a/Services/Uploads/BackupExtractor.cs b/Services/Uploads/BackupExtractor.cs
+new file mode 100644
+index 0000000..ab773ad
+--- /dev/null
++++ b/Services/Uploads/BackupExtractor.cs
+@@ -0,0 +1,126 @@
++using System.Diagnostics;
++using System.IO.Compression;
++using Microsoft.Extensions.Options;
++using SqlRestoreManager.Configuration;
++using SqlRestoreManager.Services.Sql;
++
++namespace SqlRestoreManager.Services.Uploads;
++
++/// <summary>
++/// Entrega o caminho de um .bak a partir do arquivo enviado/escolhido.
++/// .bak e .zip são tratados pelo .NET; .rar e .7z exigem o 7-Zip no servidor.
++/// </summary>
++public sealed class BackupExtractor
++{
++    private static readonly string[] NativeExtensions = [".bak", ".zip"];
++    private static readonly string[] SevenZipExtensions = [".rar", ".7z"];
++
++    private readonly RestoreOptions _options;
++    private readonly ILogger<BackupExtractor> _logger;
++
++    public BackupExtractor(IOptions<RestoreOptions> options, ILogger<BackupExtractor> logger)
++    {
++        _options = options.Value;
++        _logger = logger;
++    }
++
++    public bool SevenZipAvailable =>
++        !string.IsNullOrWhiteSpace(_options.SevenZipPath) && File.Exists(_options.SevenZipPath);
++
++    public IReadOnlyList<string> AllowedExtensions =>
++        SevenZipAvailable ? [.. NativeExtensions, .. SevenZipExtensions] : NativeExtensions;
++
++    public bool IsAllowed(string fileName) =>
++        AllowedExtensions.Contains(Path.GetExtension(fileName).ToLowerInvariant());
++
++    /// <summary>Extensões conhecidas, mesmo sem 7-Zip (para mensagem de erro melhor).</summary>
++    public static bool IsArchiveExtension(string fileName) =>
++        SevenZipExtensions.Contains(Path.GetExtension(fileName).ToLowerInvariant());
++
++    /// <summary>
++    /// Retorna o caminho local do .bak. Compactados são extraídos em <paramref name="workFolder"/>.
++    /// </summary>
++    public async Task<string> PrepareAsync(string sourcePath, string workFolder, CancellationToken ct)
++    {
++        var extension = Path.GetExtension(sourcePath).ToLowerInvariant();
++
++        if (extension == ".bak")
++            return sourcePath;
++
++        if (!IsAllowed(sourcePath))
++            throw new RestoreValidationException(IsArchiveExtension(sourcePath)
++                ? $"Arquivos {extension} exigem o 7-Zip no servidor (Restore:SevenZipPath)."
++                : $"Extensão não suportada: {extension}.");
++
++        var extractFolder = Path.Combine(workFolder, "extract");
++        Directory.CreateDirectory(extractFolder);
++
++        var bak = extension == ".zip"
++            ? await Task.Run(() => ExtractZip(sourcePath, extractFolder), ct)
++            : await ExtractWithSevenZipAsync(sourcePath, extractFolder, ct);
++
++        var size = new FileInfo(bak).Length;
++        if (size > _options.MaxExtractedBytes)
++        {
++            File.Delete(bak);
++            throw new RestoreValidationException(
++                $"O .bak extraído tem {size / 1024 / 1024} MB e excede o limite de {_options.MaxExtractedGB} GB.");
++        }
++
++        _logger.LogInformation("Extraído {Bak} ({SizeMB:N0} MB) de {Source}.", bak, size / 1024d / 1024d, sourcePath);
++        return bak;
++    }
++
++    private string ExtractZip(string sourcePath, string extractFolder)
++    {
++        // Nome de saída fixo: nada vindo do arquivo vira caminho (proteção contra Zip Slip).
++        var output = Path.Combine(extractFolder, "backup.bak");
++
++        using var archive = ZipFile.OpenRead(sourcePath);
++        var entries = archive.Entries
++            .Where(e => !string.IsNullOrEmpty(e.Name) &&
++                        string.Equals(Path.GetExtension(e.Name), ".bak", StringComparison.OrdinalIgnoreCase))
++            .ToList();
++
++        if (entries.Count != 1)
++            throw new RestoreValidationException(
++                $"O arquivo compactado deve conter exatamente um .bak (encontrados: {entries.Count}).");
++
++        if (entries[0].Length > _options.MaxExtractedBytes)
++            throw new RestoreValidationException(
++                $"O .bak descompactado excede o limite de {_options.MaxExtractedGB} GB.");
++
++        entries[0].ExtractToFile(output, overwrite: true);
++        return output;
++    }
++
++    private async Task<string> ExtractWithSevenZipAsync(string sourcePath, string extractFolder, CancellationToken ct)
++    {
++        // "e" ignora a estrutura de pastas do arquivo e extrai só os .bak.
++        var arguments = $"e -y -bso0 -bsp0 -o\"{extractFolder}\" \"{sourcePath}\" *.bak -r";
++        var info = new ProcessStartInfo(_options.SevenZipPath!, arguments)
++        {
++            RedirectStandardError = true,
++            RedirectStandardOutput = true,
++            UseShellExecute = false,
++            CreateNoWindow = true
++        };
++
++        using var process = Process.Start(info)
++            ?? throw new InvalidOperationException($"Não foi possível executar {_options.SevenZipPath}.");
++
++        var stderr = await process.StandardError.ReadToEndAsync(ct);
++        await process.WaitForExitAsync(ct);
++
++        if (process.ExitCode != 0)
++            throw new RestoreValidationException(
++                $"Falha ao extrair o arquivo (7-Zip código {process.ExitCode}). {stderr.Trim()}");
++
++        var files = Directory.GetFiles(extractFolder, "*.bak", SearchOption.TopDirectoryOnly);
++        if (files.Length != 1)
++            throw new RestoreValidationException(
++                $"O arquivo compactado deve conter exatamente um .bak (encontrados: {files.Length}).");
++
++        return files[0];
++    }
++}
+diff --git a/Services/Uploads/BackupLibrary.cs b/Services/Uploads/BackupLibrary.cs
+new file mode 100644
+index 0000000..8f1393e
+--- /dev/null
++++ b/Services/Uploads/BackupLibrary.cs
+@@ -0,0 +1,71 @@
++using Microsoft.Extensions.Options;
++using SqlRestoreManager.Configuration;
++using SqlRestoreManager.Services.Sql;
++
++namespace SqlRestoreManager.Services.Uploads;
++
++public sealed record LibraryFile(string Name, long SizeBytes, DateTime ModifiedAt)
++{
++    public double SizeMB => SizeBytes / 1024d / 1024d;
++}
++
++/// <summary>
++/// Pasta do servidor onde os backups são copiados manualmente
++/// (alternativa ao upload, sem limite de tamanho).
++/// </summary>
++public sealed class BackupLibrary
++{
++    private readonly RestoreOptions _options;
++    private readonly BackupExtractor _extractor;
++
++    public BackupLibrary(IOptions<RestoreOptions> options, BackupExtractor extractor)
++    {
++        _options = options.Value;
++        _extractor = extractor;
++    }
++
++    public bool Enabled => !string.IsNullOrWhiteSpace(_options.LibraryPath);
++
++    public IReadOnlyList<LibraryFile> List()
++    {
++        if (!Enabled)
++            return [];
++
++        if (!Directory.Exists(_options.LibraryPath))
++            throw new RestoreValidationException(
++                $"A pasta de backups não foi encontrada: {_options.LibraryPath}");
++
++        return new DirectoryInfo(_options.LibraryPath!)
++            .EnumerateFiles("*", SearchOption.TopDirectoryOnly)
++            .Where(f => _extractor.IsAllowed(f.Name))
++            .OrderByDescending(f => f.LastWriteTime)
++            .Select(f => new LibraryFile(f.Name, f.Length, f.LastWriteTime))
++            .ToList();
++    }
++
++    /// <summary>Valida o nome informado e devolve o arquivo real da pasta.</summary>
++    public FileInfo Resolve(string? fileName)
++    {
++        if (!Enabled)
++            throw new RestoreValidationException("A pasta de backups não está configurada (Restore:LibraryPath).");
++
++        if (string.IsNullOrWhiteSpace(fileName))
++            throw new RestoreValidationException("Selecione um arquivo da pasta.");
++
++        // Só nome simples: nada de subpastas, ".." ou caminho absoluto.
++        var name = fileName.Trim();
++        if (!string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal))
++            throw new RestoreValidationException("Nome de arquivo inválido.");
++
++        if (!_extractor.IsAllowed(name))
++            throw new RestoreValidationException(
++                $"Extensão não suportada. Permitidas: {string.Join(", ", _extractor.AllowedExtensions)}.");
++
++        var file = new FileInfo(Path.Combine(_options.LibraryPath!, name));
++        if (!file.Exists)
++            throw new RestoreValidationException($"Arquivo não encontrado na pasta: {name}",
++                StatusCodes.Status404NotFound);
++
++        return file;
++    }
++}
+diff --git a/Services/Uploads/BackupUploadService.cs b/Services/Uploads/BackupUploadService.cs
+index 09dbed6..e50b5ed 100644
+--- a/Services/Uploads/BackupUploadService.cs
++++ b/Services/Uploads/BackupUploadService.cs
+@@ -24,14 +24,16 @@ public sealed class BackupUploadService
+ {
+     private const int BufferSize = 1024 * 1024;
+     private const int MaxFileNameLength = 260;
+-    private static readonly string[] AllowedExtensions = [".bak", ".zip"];
+ 
+     private readonly RestoreOptions _options;
++    private readonly BackupExtractor _extractor;
+     private readonly ILogger<BackupUploadService> _logger;
+ 
+-    public BackupUploadService(IOptions<RestoreOptions> options, ILogger<BackupUploadService> logger)
++    public BackupUploadService(
++        IOptions<RestoreOptions> options, BackupExtractor extractor, ILogger<BackupUploadService> logger)
+     {
+         _options = options.Value;
++        _extractor = extractor;
+         _logger = logger;
+     }
+ 
+@@ -73,8 +75,9 @@ public sealed class BackupUploadService
+                 var originalName = Path.GetFileName(rawName ?? string.Empty);
+                 var extension = Path.GetExtension(originalName).ToLowerInvariant();
+ 
+-                if (!AllowedExtensions.Contains(extension))
+-                    throw new RestoreValidationException("Somente arquivos .bak ou .zip são permitidos.");
++                if (!_extractor.IsAllowed(originalName))
++                    throw new RestoreValidationException(
++                        $"Extensão não suportada. Permitidas: {string.Join(", ", _extractor.AllowedExtensions)}.");
+ 
+                 var path = Path.Combine(folder, "upload" + extension);
+                 _logger.LogInformation("Job {JobId}: recebendo '{File}' em {Path}.", jobId, originalName, path);
+diff --git a/Views/Restore/Index.cshtml b/Views/Restore/Index.cshtml
+index dc9e063..83ed234 100644
+--- a/Views/Restore/Index.cshtml
++++ b/Views/Restore/Index.cshtml
+@@ -5,11 +5,40 @@
+ }
+ <section class="card">
+     <h1>Restaurar banco SQL Server</h1>
+-    <p>Envie um backup <b>.bak</b> ou um <b>.zip</b> com exatamente um .bak (máximo @maxUploadMb MB).</p>
++    <p>
++        Formatos aceitos: @string.Join(", ", Model.AllowedExtensions). Compactados devem conter
++        exatamente um .bak. Envio pelo navegador: máximo @maxUploadMb MB.
++    </p>
+ 
+     <form id="restoreForm" novalidate>
+-        <label for="file">Arquivo</label>
+-        <input id="file" name="file" type="file" accept=".bak,.zip" required />
++        @if (Model.LibraryEnabled)
++        {
++            <label>Origem do backup</label>
++            <div class="origin">
++                <label class="confirm">
++                    <input type="radio" name="origin" value="upload" checked /> Enviar arquivo do meu computador
++                </label>
++                <label class="confirm">
++                    <input type="radio" name="origin" value="library" /> Usar arquivo da pasta do servidor
++                </label>
++            </div>
++        }
++
++        <div id="uploadSource">
++            <label for="file">Arquivo</label>
++            <input id="file" name="file" type="file" accept="@string.Join(",", Model.AllowedExtensions)" />
++        </div>
++
++        @if (Model.LibraryEnabled)
++        {
++            <div id="librarySource" class="hidden">
++                <label for="libraryFile">Arquivo na pasta do servidor</label>
++                <select id="libraryFile">
++                    <option value="">Carregando...</option>
++                </select>
++                <button type="button" id="btnReloadFiles" class="link-button">Atualizar lista</button>
++            </div>
++        }
+ 
+         <label for="targetDatabase">Banco de destino</label>
+         <select id="targetDatabase" name="targetDatabase" required>
+@@ -69,9 +98,13 @@
+         sessions: "@Url.Action("Sessions", "Restore")",
+         status: "@Url.Action("Status", "Restore")",
+         start: "@Url.Action("Start", "Restore")",
++        startFromFile: "@Url.Action("StartFromFile", "Restore")",
++        files: "@Url.Action("Files", "Restore")",
+         hub: "@Url.Content("~/restoreHub")"
+     };
+     const maxBytes = @maxUploadMb * 1024 * 1024;
++    const libraryEnabled = @(Model.LibraryEnabled ? "true" : "false");
++    const allowedExtensions = @Html.Raw(Json.Serialize(Model.AllowedExtensions));
+     const terminalFailures = ["Error", "Interrupted"];
+ 
+     const $ = id => document.getElementById(id);
+@@ -80,6 +113,7 @@
+     const dbSelect = $("targetDatabase");
+     const sessionsBox = $("sessions");
+     const submitButton = $("btnSubmit");
++    const librarySelect = $("libraryFile");
+     const errorBox = $("error");
+     const successBox = $("success");
+ 
+@@ -105,6 +139,46 @@
+         }
+     }
+ 
++    // ------------------------------------------- Origem (upload x pasta)
++    const currentOrigin = () =>
++        libraryEnabled ? document.querySelector('input[name="origin"]:checked').value : "upload";
++
++    function applyOrigin() {
++        const library = currentOrigin() === "library";
++        $("uploadSource").classList.toggle("hidden", library);
++        $("librarySource").classList.toggle("hidden", !library);
++        if (library && librarySelect.dataset.loaded !== "1") loadFiles();
++    }
++
++    async function loadFiles() {
++        librarySelect.replaceChildren(new Option("Carregando...", ""));
++        try {
++            const response = await fetch(urls.files);
++            if (!response.ok) {
++                librarySelect.replaceChildren(new Option("Selecione...", ""));
++                show(errorBox, await response.text());
++                return;
++            }
++
++            const files = await response.json();
++            const options = [new Option("Selecione...", "")];
++            for (const f of files)
++                options.push(new Option(`${f.name} — ${f.sizeMB.toLocaleString("pt-BR")} MB — ${f.modifiedAt}`, f.name));
++
++            librarySelect.replaceChildren(...options);
++            librarySelect.dataset.loaded = "1";
++            if (!files.length) librarySelect.replaceChildren(new Option("Nenhum arquivo na pasta", ""));
++        } catch (err) {
++            show(errorBox, err.message);
++        }
++    }
++
++    if (libraryEnabled) {
++        for (const radio of document.querySelectorAll('input[name="origin"]'))
++            radio.addEventListener("change", applyOrigin);
++        $("btnReloadFiles").addEventListener("click", loadFiles);
++    }
++
+     // ------------------------------------------------------------ Sessões
+     async function loadSessions() {
+         hide(sessionsBox);
+@@ -245,10 +319,19 @@
+         hide(errorBox);
+         hide(successBox);
+ 
++        const fromLibrary = currentOrigin() === "library";
+         const file = fileInput.files[0];
+-        if (!file) return show(errorBox, "Selecione um arquivo.");
+-        if (!/\.(bak|zip)$/i.test(file.name)) return show(errorBox, "Somente arquivos .bak ou .zip.");
+-        if (file.size > maxBytes) return show(errorBox, `O arquivo tem ${mb(file.size)} e excede o limite de @maxUploadMb MB.`);
++
++        if (fromLibrary) {
++            if (!librarySelect.value) return show(errorBox, "Selecione um arquivo da pasta do servidor.");
++        } else {
++            if (!file) return show(errorBox, "Selecione um arquivo.");
++            if (!allowedExtensions.some(ext => file.name.toLowerCase().endsWith(ext)))
++                return show(errorBox, `Formatos aceitos: ${allowedExtensions.join(", ")}.`);
++            if (file.size > maxBytes)
++                return show(errorBox, `O arquivo tem ${mb(file.size)} e excede o limite de @maxUploadMb MB.`);
++        }
++
+         if (!dbSelect.value) return show(errorBox, "Selecione o banco de destino.");
+         if (!$("confirmReplace").checked) return show(errorBox, "Confirme que o banco será substituído.");
+         if (!confirm(`ATENÇÃO: o banco ${dbSelect.value} será totalmente substituído. Continuar?`)) return;
+@@ -256,21 +339,30 @@
+         submitButton.disabled = true;
+         finished = false;
+         currentJobId = null;
+-        setBar("uploadBar", 0);
++        setBar("uploadBar", fromLibrary ? 100 : 0);
+         setBar("restoreBar", 0);
+-        $("uploadText").textContent = "";
+-        $("restoreText").textContent = "Aguardando envio do arquivo...";
++        $("uploadText").textContent = fromLibrary ? "Arquivo já está no servidor." : "";
++        $("restoreText").textContent = fromLibrary ? "Enviando para a fila..." : "Aguardando envio do arquivo...";
+         $("progressBox").classList.remove("hidden");
+ 
+-        const data = new FormData();
+-        data.append("file", file, file.name);
+-
+         try {
+             await connectionStarted;
+-            const result = await upload(`${urls.start}?targetDatabase=${encodeURIComponent(dbSelect.value)}`, data);
++
++            let result;
++            if (fromLibrary) {
++                const url = `${urls.startFromFile}?targetDatabase=${encodeURIComponent(dbSelect.value)}`
++                          + `&fileName=${encodeURIComponent(librarySelect.value)}`;
++                const response = await fetch(url, { method: "POST" });
++                if (!response.ok) throw new Error(await response.text() || `Falha (HTTP ${response.status}).`);
++                result = await response.json();
++            } else {
++                const data = new FormData();
++                data.append("file", file, file.name);
++                result = await upload(`${urls.start}?targetDatabase=${encodeURIComponent(dbSelect.value)}`, data);
++                $("uploadText").textContent = `Envio concluído (${mb(file.size)}).`;
++            }
+ 
+             currentJobId = result.jobId;
+-            $("uploadText").textContent = `Envio concluído (${mb(file.size)}).`;
+             $("restoreText").textContent = "Na fila de restore...";
+ 
+             await joinJob();
+@@ -281,6 +373,7 @@
+     });
+ 
+     dbSelect.addEventListener("change", loadSessions);
++    if (libraryEnabled) applyOrigin();
+ })();
+ </script>
+ }
+diff --git a/wwwroot/css/site.css b/wwwroot/css/site.css
+index 9f2c111..c49288a 100644
+--- a/wwwroot/css/site.css
++++ b/wwwroot/css/site.css
+@@ -28,3 +28,6 @@ button:disabled{opacity:.5;cursor:not-allowed}
+ .success.success-warning{color:#7a5400;white-space:pre-line}
+ details summary{cursor:pointer;font-weight:600;font-size:13px}
+ .post-restore-log{white-space:pre-wrap;margin:6px 0 0;font-size:12px;background:#f3f5f8;padding:10px;border-radius:7px}
++/* Origem do backup */
++.origin{margin-top:7px}.origin label{margin:4px 0}
++.link-button{margin-top:10px;padding:7px 12px;background:#e5e9ef;color:#20242a;font-size:13px}
+-- 
+2.43.0
+

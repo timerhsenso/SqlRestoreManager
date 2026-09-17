@@ -1,28 +1,76 @@
 # SQL Restore Manager
 
-Aplicação ASP.NET Core 8 MVC para restaurar bancos SQL Server pelo navegador
-(bancos de clientes para testes/validação — **não usar contra bancos de produção**).
+Ferramenta web para restaurar bancos SQL Server pelo navegador, sem abrir sessão no servidor.
 
-## Status
+Feita para o cenário de quem recebe backups de clientes e precisa subi-los em um ambiente de
+homologação para testes e validações: cada cliente gera o backup de um jeito, e a ferramenta
+se encarrega de aceitar o que vier, restaurar com segurança e deixar o banco pronto para uso.
 
-- **Fase 1 (atual)** – correções de funcionamento: upload grande em streaming, progresso real,
-  restore seguro (OFFLINE + rollback para ONLINE), lock entre instâncias, worker resiliente,
-  reconciliação de jobs interrompidos, correção de XSS.
-- Fase 2 – autenticação/autorização, antiforgery, auditoria, Serilog, secrets.
-- Fase 3 – Clean Architecture, AdminLTE/DataTables, testes.
-- Fase 4 – restore a partir de pasta do servidor, upload em chunks (> 4 GB), pós-restore etc.
+> **Atenção:** esta ferramenta executa `RESTORE` e altera bancos. Ela **não possui autenticação**
+> até o momento. Mantenha o acesso restrito por rede, VPN ou firewall e **nunca** aponte a
+> whitelist para bancos de produção.
 
-## Como funciona
+## Recursos
 
-1. O navegador envia o `.bak`/`.zip` (streaming) para `Restore:TempPath\<jobId>\`.
-2. O job entra na fila em memória (um restore por vez; um job por banco).
-3. O worker extrai o `.zip` (se houver), converte o caminho para a visão do SQL Server
-   (`Restore:SqlServerTempPath`) e executa `RESTORE HEADERONLY`/`FILELISTONLY`.
-4. `sp_getapplock` impede restores simultâneos do mesmo banco (inclusive dev x IIS).
-5. Banco de destino → `OFFLINE WITH ROLLBACK IMMEDIATE` → `RESTORE ... WITH REPLACE, MOVE ...`.
-   Se o restore falhar logo no início, o banco volta para `ONLINE`.
-6. Progresso lido de `sys.dm_exec_requests` pelo SPID da conexão do restore, enviado via SignalR
-   apenas para quem iniciou o job.
+**Envio do backup**
+- Upload pelo navegador em streaming, com barra de progresso (até ~4 GB, limite do IIS).
+- Ou restauração a partir de uma pasta do servidor, sem limite de tamanho.
+- Formatos `.bak`, `.zip` e, com o 7‑Zip instalado, `.rar` e `.7z`.
+
+**Escolha do destino**
+- Lista os bancos reais do servidor (`sys.databases`), nunca os de sistema.
+- Bloqueio configurável por nome ou padrão (`PROD_*`), exibido desabilitado ou oculto.
+- Opção de criar um banco novo digitando o nome.
+- Mostra as conexões ativas que serão encerradas antes do restore.
+
+**Execução**
+- Fila em memória, um restore por vez, com lock entre instâncias (`sp_getapplock`).
+- `RESTORE VERIFYONLY` antes de sobrescrever (usa `CHECKSUM` quando o backup tiver).
+- Backup `COPY_ONLY` opcional do banco atual, com retenção automática.
+- Banco em `OFFLINE WITH ROLLBACK IMMEDIATE`, `RESTORE ... WITH REPLACE` e `MOVE` automático
+  de todos os arquivos (dados, log, FILESTREAM e full‑text).
+- Progresso real lido de `sys.dm_exec_requests`, transmitido por SignalR.
+- Cancelamento do job na fila ou em andamento.
+
+**Pós-restore automático**
+- Remove replicação herdada do servidor de origem.
+- Coloca o banco em `RECOVERY SIMPLE`.
+- Reduz os arquivos de log e define crescimento fixo.
+- Corrige usuários órfãos.
+- Executa scripts `.sql` seus, globais ou por banco.
+
+**Histórico**
+- Registro completo de cada job, com etapas, alertas e tamanho do log antes e depois.
+- Busca, filtro por status, paginação e exportação CSV.
+- Reconciliação automática de jobs interrompidos por reciclagem do App Pool.
+
+**Interface**
+- CSS próprio, modal e toasts sem bibliotecas; cliente SignalR servido localmente.
+- Nenhuma requisição para a internet: funciona em rede fechada.
+
+## Requisitos
+
+- .NET 8 (ASP.NET Core) — IIS com o *Hosting Bundle* em produção.
+- SQL Server 2016 ou superior.
+- Login SQL com permissão para `RESTORE`/`ALTER DATABASE` e `VIEW SERVER STATE`
+  (`sysadmin` é o mais simples em servidor dedicado de homologação; necessário para
+  `sp_removedbreplication` e `DBCC SHRINKFILE` do pós-restore).
+- 7‑Zip, opcional, para `.rar` e `.7z`.
+
+## Instalação
+
+1. **Banco de histórico** — execute, em ordem, os scripts de `Database/`:
+   `001_RestoreHistory.sql`, `002_RestoreHistory_PostRestore.sql`,
+   `003_RestoreHistory_SafetyBackup.sql`. São idempotentes.
+2. **Pastas** — crie a pasta temporária e, se for usar, a de backups e a de backups de segurança.
+   A conta do serviço SQL Server precisa de leitura na pasta temporária e de escrita nas pastas
+   de dados e log.
+3. **Configuração** — ajuste `appsettings.json`. Em desenvolvimento, use
+   `appsettings.Development.json` e *User Secrets* para as connection strings.
+4. **IIS** — publique e configure o App Pool: *No Managed Code*, `Start Mode = AlwaysRunning`,
+   `Idle Time-out = 0` e sem reciclagem periódica. Sem isso, restores longos podem ser abortados.
+
+O `web.config` do projeto já libera uploads de até ~4 GB (o padrão do IIS é ~28 MB).
 
 ## Configuração (`Restore`)
 
@@ -30,63 +78,81 @@ Aplicação ASP.NET Core 8 MVC para restaurar bancos SQL Server pelo navegador
 |---|---|
 | `TempPath` | Pasta onde **a aplicação** grava os uploads (local ou UNC). |
 | `SqlServerTempPath` | A mesma pasta vista **pelo SQL Server**. Vazio = igual a `TempPath`. |
-| `DataPath` / `LogPath` | Pastas de .mdf/.ldf **no servidor SQL**. Vazio = padrão da instância. |
-| `MaxUploadMB` | Limite de upload (1–4000; o IIS não aceita mais que ~4 GB). |
-| `MaxExtractedGB` | Limite do .bak descompactado de um .zip. |
+| `LibraryPath` / `SqlServerLibraryPath` | Pasta de backups copiados manualmente (aplicação / SQL Server). |
+| `DataPath` / `LogPath` | Pastas dos `.mdf`/`.ldf` no servidor. Vazio = padrão da instância. |
+| `MaxUploadMB` | Limite do upload pelo navegador (1–4000). |
+| `MaxExtractedGB` | Limite do `.bak` descompactado. |
+| `SevenZipPath` | Caminho do `7z.exe`. Habilita `.rar` e `.7z`. |
+| `BlockedDatabases` | Bancos que não podem ser restaurados. Aceita `*` e `?`. |
+| `ShowBlockedDatabases` | Bloqueados aparecem desabilitados (`true`) ou ocultos (`false`). |
+| `AllowNewDatabases` | Permite criar banco novo pelo nome digitado. |
 | `ProgressPollSeconds` | Intervalo de leitura do progresso. |
 | `TempRetentionHours` | Idade mínima para limpeza de pastas temporárias órfãs. |
-| `NodeName` | Nome da instância no histórico. Vazio = nome da máquina. |
-| `BlockedDatabases` | Bancos que não podem ser restaurados. Aceita `*` e `?` (ex.: `PROD_*`). |
-| `ShowBlockedDatabases` | `true` = bloqueados aparecem desabilitados; `false` = ficam ocultos. |
+| `NodeName` | Identificação da instância no histórico. Vazio = nome da máquina. |
 
-A lista de destino vem de `sys.databases` do servidor. Bancos de sistema (`master`, `model`, `msdb`, `tempdb`, `distribution`, `SSISDB`) nunca aparecem, e o banco de histórico (`HistoryConnection`) aparece sempre bloqueado. O banco de destino precisa já existir no servidor e é revalidado no upload e novamente no início do restore.
+**`Restore:PreRestore`**
 
-A aplicação **não sobe** se a configuração for inválida (`ValidateOnStart`).
+| Chave | Padrão | Descrição |
+|---|---|---|
+| `VerifyBackup` | `true` | `RESTORE VERIFYONLY` antes de sobrescrever. |
+| `SafetyBackup` | `false` | `BACKUP ... WITH COPY_ONLY` do banco atual. |
+| `SafetyBackupPath` | vazio | Pasta do backup de segurança, vista pelo SQL Server. |
+| `SafetyBackupCompression` | `true` | Usa `COMPRESSION`, com fallback automático. |
+| `SafetyBackupRetentionDays` | `7` | Retenção dos backups de segurança. 0 = nunca apagar. |
 
-## Banco de histórico
+**`Restore:PostRestore`**
 
-Execute `Database/001_RestoreHistory.sql` (idempotente) antes do primeiro uso e a cada atualização.
-Não há mais `EnsureCreated()`.
+| Chave | Padrão | Descrição |
+|---|---|---|
+| `Enabled` | `true` | Liga/desliga todo o pós-restore. |
+| `RemoveReplication` | `true` | `sp_removedbreplication` quando o banco vem com replicação. |
+| `SetRecoverySimple` | `true` | `RECOVERY SIMPLE`. |
+| `ShrinkLog` | `true` | `CHECKPOINT` + `DBCC SHRINKFILE` nos arquivos de log. |
+| `LogTargetSizeMB` | `512` | Tamanho alvo do log. |
+| `LogGrowthMB` | `256` | Crescimento fixo do log. 0 = não altera. |
+| `FixOrphanUsers` | `true` | `ALTER USER ... WITH LOGIN` para usuários com login de mesmo nome. |
+| `ScriptsPath` | vazio | Pasta com `.sql` (raiz = todos os bancos; subpasta = só aquele banco). |
+| `CommandTimeoutMinutes` | `30` | Timeout de cada comando do pós-restore. |
 
-## Ambiente de desenvolvimento (Visual Studio → SQL na rede)
+Configuração inválida impede a aplicação de subir (`ValidateOnStart`), com a mensagem do que corrigir.
 
-O upload é gravado pela sua máquina, mas quem lê o `.bak` é o serviço do SQL Server remoto.
-Por isso, use um compartilhamento da pasta temporária do servidor:
+## Aplicação em outra máquina (desenvolvimento)
 
-1. No servidor SQL, crie `D:\RestoreManager\Temp` e compartilhe como `\\SERVIDOR-SQL\RestoreTemp`.
-2. Permissões:
-   - seu usuário Windows: **modificar** no compartilhamento e no NTFS;
-   - conta do serviço SQL Server (ex.: `NT Service\MSSQLSERVER`): **leitura** no NTFS.
-3. `appsettings.Development.json`:
-   ```json
-   "Restore": {
-     "TempPath": "\\\\SERVIDOR-SQL\\RestoreTemp",
-     "SqlServerTempPath": "D:\\RestoreManager\\Temp"
-   }
-   ```
-4. Seu login SQL (Integrated Security) precisa de `dbcreator` (ou `sysadmin`) e `VIEW SERVER STATE`.
+Quando a aplicação roda fora do servidor SQL, quem grava o arquivo é a aplicação, mas quem o lê é o
+serviço do SQL Server. Compartilhe a pasta temporária e informe os dois caminhos:
 
-## Produção (IIS na mesma máquina do SQL Server)
+```json
+"Restore": {
+  "TempPath": "\\\\SERVIDOR\\RestoreTemp",
+  "SqlServerTempPath": "C:\\RestoreManager\\Temp"
+}
+```
 
-1. Instale o **ASP.NET Core 8 Hosting Bundle** e habilite o recurso **WebSocket Protocol** do IIS.
-2. Publique (`dotnet publish -c Release`). O `web.config` do projeto já libera uploads de até ~4 GB.
-3. Deixe `SqlServerTempPath` vazio (`TempPath` local).
-4. **App Pool** (essencial para restores longos não serem abortados):
-   - .NET CLR version: *No Managed Code*;
-   - Start Mode: `AlwaysRunning`;
-   - Idle Time-out (minutes): `0`;
-   - Regular Time Interval (minutes): `0` (sem reciclagem periódica);
-   - no site: Preload Enabled = `True`.
-5. Permissões:
-   - `IIS APPPOOL\<pool>`: modificar em `TempPath`;
-   - conta do serviço SQL Server: leitura em `TempPath`, modificar em `DataPath`/`LogPath`;
-   - login SQL `IIS APPPOOL\<pool>`: `dbcreator` + `VIEW SERVER STATE` (ou `sysadmin`)
-     e `db_datareader`/`db_datawriter` no banco `RestoreManager`.
+## O que é aceito
 
-## Limitações conhecidas (Fase 1)
+Backups **FULL**, com ou sem checksum, com ou sem compressão, com vários conjuntos no mesmo arquivo
+(usa o FULL mais recente), com qualquer nome lógico de arquivo e com múltiplos arquivos de dados e log.
 
-- **Sem autenticação.** Restrinja por rede/firewall até a Fase 2.
-- Upload limitado a ~4 GB pelo IIS; use `.zip` para backups maiores (o limite do .bak extraído é `MaxExtractedGB`).
-- Fila em memória: se o App Pool reiniciar, jobs em andamento viram `Interrupted`.
-  Se isso ocorrer durante o RESTORE, o banco pode ficar em `RESTORING` — basta restaurar novamente.
-- Apenas backups FULL (diferencial/log não suportados).
+Recusa, com mensagem explicando: backup diferencial ou de log isolado, backup gerado em versão do
+SQL Server mais nova que a do destino e arquivo compactado com mais de um `.bak`.
+
+## Estrutura
+
+```
+Configuration/   opções e validação no startup
+Controllers/     Restore (tela e API) e History
+Data/            DbContext do histórico
+Database/        scripts SQL (fonte da verdade do schema)
+Models/          entidades, status e view models
+Services/Sql/    catálogo de bancos, restore, pós-restore
+Services/Jobs/   fila, worker, processador e manutenção
+Services/Uploads/ upload em streaming, extração e pasta de backups
+Views/ wwwroot/  interface (sem dependências externas)
+```
+
+## Roadmap
+
+- Autenticação e autorização (Windows/AD ou Identity), antiforgery e auditoria de usuário.
+- Logging estruturado com Serilog e segredos fora do `appsettings`.
+- Upload em chunks para arquivos acima de 4 GB.
+- Jobs persistentes, no lugar da fila em memória.

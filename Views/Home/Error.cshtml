@@ -1,1 +1,11 @@
-<section class="card"><h1>Erro</h1><p>Ocorreu um erro na aplicação.</p></section>
+@{
+    ViewData["Title"] = "Erro";
+}
+<section class="card">
+    <h1>Algo deu errado</h1>
+    <p class="card-lead">
+        A operação não pôde ser concluída. Verifique o histórico para ver se o restore chegou a ser
+        registrado e consulte o log da aplicação para o detalhe técnico.
+    </p>
+    <p><a asp-controller="Restore" asp-action="Index">Voltar para a tela de restore</a></p>
+</section>
