@@ -1,0 +1,316 @@
+@model BackupIndexViewModel
+@{
+    ViewData["Title"] = "Backup";
+}
+@functions {
+    static string BadgeClass(string status) => status switch
+    {
+        BackupStatus.Success => "badge-ok",
+        BackupStatus.Warning => "badge-warn",
+        BackupStatus.Error => "badge-error",
+        _ => "badge-active"
+    };
+}
+<section class="card">
+    <h1>Backup dos bancos</h1>
+    <p class="card-lead">
+        Gera um <b>BACKUP COPY_ONLY</b> de cada banco selecionado em <code>@Model.BackupPath</code>,
+        com o nome <code>banco_DDMMAAAA_HHmm.bak</code>.
+        @if (Model.ShrinkLogBefore)
+        {
+            <text>O log é reduzido antes de cada backup.</text>
+        }
+        @if (Model.RetentionDays > 0)
+        {
+            <text>Arquivos com mais de @Model.RetentionDays dias são removidos ao final.</text>
+        }
+    </p>
+
+    @if (!Model.Enabled)
+    {
+        <div class="alert alert-warn">O módulo de backup está desabilitado (<code>Backup:Enabled</code>).</div>
+    }
+    else if (Model.LoadError is not null)
+    {
+        <div class="alert alert-error">Não foi possível listar os bancos. @Model.LoadError</div>
+    }
+    else
+    {
+        <div id="restoreBlock" class="alert alert-warn @(Model.RestoreInProgress ? "" : "hidden")">
+            Há um <b>restore em andamento</b>. O backup só pode ser iniciado depois que ele terminar.
+        </div>
+
+        <form id="backupForm" novalidate>
+            <div class="field">
+                <span class="label">Bancos (@Model.Targets.Count)</span>
+                <div class="actions" style="margin-top:0">
+                    <button type="button" id="btnAll" class="btn-ghost btn-small">Marcar todos</button>
+                    <button type="button" id="btnNone" class="btn-ghost btn-small">Desmarcar todos</button>
+                </div>
+                <div class="checklist">
+                    @foreach (var target in Model.Targets)
+                    {
+                        var online = string.Equals(target.State, "ONLINE", StringComparison.OrdinalIgnoreCase);
+                        <label class="check" style="margin-top:0">
+                            @if (online)
+                            {
+                                <input type="checkbox" name="databases" value="@target.Name" checked />
+                            }
+                            else
+                            {
+                                <input type="checkbox" name="databases" value="@target.Name" disabled />
+                            }
+                            <span>
+                                @target.Name
+                                <span class="sub">@target.SizeMB.ToString("N0") MB@(online ? "" : $" · {target.State}")</span>
+                            </span>
+                        </label>
+                    }
+                </div>
+            </div>
+
+            <div class="actions">
+                <button type="submit" id="btnBackup">Fazer backup agora</button>
+            </div>
+        </form>
+
+        <div id="console" class="console hidden">
+            <div class="console-row">
+                <div class="console-head"><b>Backup</b><span class="console-value" id="backupValue">0%</span></div>
+                <div class="track" id="backupTrack"><div id="backupBar"></div></div>
+                <div class="console-note" id="backupText">Iniciando...</div>
+            </div>
+        </div>
+
+        <div id="error" class="alert alert-error hidden" role="alert"></div>
+        <div id="success" class="alert alert-ok hidden" role="status"></div>
+    }
+</section>
+
+<section class="card wide">
+    <h2>Últimas execuções</h2>
+    @if (Model.Runs.Count == 0)
+    {
+        <p class="muted">Nenhum backup executado ainda.</p>
+    }
+    else
+    {
+        <div class="table-scroll">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Início</th>
+                        <th>Origem</th>
+                        <th>Status</th>
+                        <th>Bancos</th>
+                        <th>Tamanho</th>
+                        <th>Fim</th>
+                        <th>Instância</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var run in Model.Runs)
+                    {
+                        <tr>
+                            <td class="num">@run.StartedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
+                            <td>@(run.Trigger == BackupTrigger.Scheduled ? "Agendado" : "Manual")</td>
+                            <td>
+                                <span class="badge @BadgeClass(run.Status)">@BackupStatus.ToLabel(run.Status)</span>
+                                @if (!string.IsNullOrWhiteSpace(run.CurrentStep))
+                                {
+                                    <div class="sub">@run.CurrentStep</div>
+                                }
+                            </td>
+                            <td class="num">@run.SucceededCount/@run.TotalDatabases</td>
+                            <td class="num">@((run.TotalSizeBytes / 1024d / 1024d).ToString("N0")) MB</td>
+                            <td class="num">@(run.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss") ?? "-")</td>
+                            <td>@(run.NodeName ?? "-")</td>
+                        </tr>
+                        if (!string.IsNullOrWhiteSpace(run.ErrorMessage))
+                        {
+                            <tr><td colspan="7"><div class="alert alert-error">@run.ErrorMessage</div></td></tr>
+                        }
+                        if (run.Items.Count > 0)
+                        {
+                            <tr>
+                                <td colspan="7">
+                                    <details open="@(run.FailedCount > 0 ? "open" : null)">
+                                        <summary>Bancos desta execução</summary>
+                                        <table>
+                                            <tbody>
+                                                @foreach (var item in run.Items.OrderBy(i => i.DatabaseName))
+                                                {
+                                                    <tr>
+                                                        <td>@item.DatabaseName</td>
+                                                        <td><span class="badge @BadgeClass(item.Status)">@BackupStatus.ToLabel(item.Status)</span></td>
+                                                        <td class="num">@((item.SizeBytes / 1024d / 1024d).ToString("N0")) MB</td>
+                                                        <td class="num">
+                                                            @if (item.LogSizeBeforeMB is not null)
+                                                            {
+                                                                <text>log @item.LogSizeBeforeMB → @item.LogSizeAfterMB MB</text>
+                                                            }
+                                                        </td>
+                                                        <td class="num">@item.DurationSeconds.ToString("N0") s</td>
+                                                        <td>
+                                                            @item.FilePath
+                                                            @if (!string.IsNullOrWhiteSpace(item.ErrorMessage))
+                                                            {
+                                                                <div class="sub">@item.ErrorMessage</div>
+                                                            }
+                                                        </td>
+                                                    </tr>
+                                                }
+                                            </tbody>
+                                        </table>
+                                    </details>
+                                </td>
+                            </tr>
+                        }
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+</section>
+
+@section Scripts {
+<script src="~/lib/signalr/signalr.min.js" asp-append-version="true"></script>
+<script>
+(() => {
+    "use strict";
+    const form = document.getElementById("backupForm");
+    if (!form) return;
+
+    const urls = {
+        start: "@Url.Action("Start", "Backup")",
+        status: "@Url.Action("Status", "Backup")",
+        hub: "@Url.Content("~/restoreHub")"
+    };
+
+    const $ = id => document.getElementById(id);
+    const submitButton = $("btnBackup");
+    const errorBox = $("error");
+    const successBox = $("success");
+
+    let currentRunId = @(Model.CurrentRunId is null ? "null" : $"\"{Model.CurrentRunId}\"");
+    let finished = currentRunId === null;
+
+    const show = (node, text) => { node.textContent = text; node.classList.remove("hidden"); };
+    const hide = node => { node.textContent = ""; node.classList.add("hidden"); };
+
+    function setProgress(percent, running) {
+        const value = Math.max(0, Math.min(100, percent));
+        $("backupBar").style.width = `${value}%`;
+        $("backupValue").textContent = `${value.toFixed(0)}%`;
+        $("backupTrack").classList.toggle("running", running === true && value < 100);
+    }
+
+    function finish(ok, message, hasWarnings) {
+        finished = true;
+        submitButton.disabled = false;
+        setProgress(100, false);
+        if (ok) {
+            show(successBox, message);
+            ui.toast(message, { type: hasWarnings ? "warn" : "ok", timeout: hasWarnings ? 0 : 9000 });
+            setTimeout(() => location.reload(), 3000);
+        } else {
+            show(errorBox, message);
+            ui.toast(message, { type: "error", timeout: 0 });
+        }
+    }
+
+    const connection = new signalR.HubConnectionBuilder().withUrl(urls.hub).withAutomaticReconnect().build();
+
+    connection.on("BackupProgress", m => {
+        if (m.runId !== currentRunId || finished) return;
+        setProgress(m.percent, true);
+        $("backupText").textContent = m.message;
+    });
+    connection.on("BackupCompleted", m => {
+        if (m.runId !== currentRunId || finished) return;
+        finish(true, m.message, m.hasWarnings);
+    });
+    connection.on("BackupFailed", m => {
+        if (m.runId !== currentRunId || finished) return;
+        finish(false, m.message, false);
+    });
+    connection.onreconnected(async () => { await join(); await refresh(); });
+
+    const started = connection.start().catch(err => console.error(err));
+
+    async function join() {
+        if (!currentRunId || connection.state !== signalR.HubConnectionState.Connected) return;
+        try { await connection.invoke("JoinBackup", currentRunId); } catch (err) { console.error(err); }
+    }
+
+    async function refresh() {
+        if (!currentRunId || finished) return;
+        try {
+            const response = await fetch(`${urls.status}?runId=${encodeURIComponent(currentRunId)}`);
+            if (!response.ok) return;
+            const s = await response.json();
+            if (finished) return;
+
+            setProgress(s.percentComplete, true);
+            $("backupText").textContent = s.currentStep || s.status;
+            if (s.status === "Success") finish(true, "Backup concluído.", false);
+            else if (s.status === "Warning") finish(true, `Backup concluído com ${s.failedCount} falha(s).`, true);
+            else if (s.status === "Error") finish(false, s.errorMessage || "Falha no backup.", false);
+        } catch (err) { console.error(err); }
+    }
+
+    setInterval(() => {
+        if (currentRunId && !finished && connection.state !== signalR.HubConnectionState.Connected) refresh();
+    }, 5000);
+
+    $("btnAll").addEventListener("click", () => toggleAll(true));
+    $("btnNone").addEventListener("click", () => toggleAll(false));
+    function toggleAll(checked) {
+        for (const box of form.querySelectorAll('input[name="databases"]:not(:disabled)')) box.checked = checked;
+    }
+
+    form.addEventListener("submit", async e => {
+        e.preventDefault();
+        hide(errorBox);
+        hide(successBox);
+
+        const selected = [...form.querySelectorAll('input[name="databases"]:checked')].map(b => b.value);
+        if (!selected.length) return show(errorBox, "Selecione ao menos um banco.");
+
+        const confirmed = await ui.confirm({
+            title: `Fazer backup de ${selected.length} banco(s)?`,
+            message: "Os logs serão reduzidos antes de cada backup e os arquivos irão para a pasta configurada.",
+            confirmText: "Iniciar backup"
+        });
+        if (!confirmed) return;
+
+        submitButton.disabled = true;
+        finished = false;
+        setProgress(0, true);
+        $("backupText").textContent = "Iniciando...";
+        $("console").classList.remove("hidden");
+
+        try {
+            await started;
+            const data = new FormData();
+            for (const name of selected) data.append("databases", name);
+
+            const response = await fetch(urls.start, { method: "POST", body: data });
+            if (!response.ok) throw new Error(await response.text() || `Falha (HTTP ${response.status}).`);
+
+            currentRunId = (await response.json()).runId;
+            await join();
+            await refresh();
+        } catch (err) {
+            finish(false, err.message, false);
+        }
+    });
+
+    if (currentRunId) {
+        $("console").classList.remove("hidden");
+        submitButton.disabled = true;
+        started.then(join).then(refresh);
+    }
+})();
+</script>
+}

@@ -23,6 +23,9 @@ public sealed class RestoreQueue
 
     public bool IsJobActive(Guid jobId) => _reservations.Values.Contains(jobId);
 
+    /// <summary>Há restore na fila ou em andamento nesta instância.</summary>
+    public bool HasActiveJobs => !_reservations.IsEmpty;
+
     public ValueTask EnqueueAsync(RestoreJob job, CancellationToken ct = default) =>
         _channel.Writer.WriteAsync(job, ct);
 

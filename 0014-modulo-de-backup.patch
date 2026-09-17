@@ -1,0 +1,1747 @@
+From 26719abea71cd9d031c927d533ca437ff035e5a7 Mon Sep 17 00:00:00 2001
+From: claude <c@x>
+Date: Thu, 17 Sep 2026 21:23:49 +0000
+Subject: [PATCH] Modulo de backup: aba, execucao manual, limpeza de log e
+ historico
+
+---
+ .gitignore                              |   5 +-
+ Configuration/BackupOptions.cs          |  35 +++
+ Configuration/BackupOptionsValidator.cs |  44 ++++
+ Controllers/BackupController.cs         | 114 +++++++++
+ Controllers/RestoreController.cs        |  10 +
+ Data/AppDbContext.cs                    |  35 +++
+ Database/004_Backup.sql                 | 121 +++++++++
+ Models/BackupIndexViewModel.cs          |  17 ++
+ Models/BackupModels.cs                  |  68 +++++
+ Program.cs                              |  11 +
+ README.md                               |  22 +-
+ Services/Backup/BackupNotifier.cs       |  44 ++++
+ Services/Backup/BackupRunner.cs         | 262 ++++++++++++++++++++
+ Services/Backup/BackupService.cs        | 173 +++++++++++++
+ Services/Jobs/RestoreQueue.cs           |   3 +
+ Services/Notifications/RestoreHub.cs    |   8 +
+ Services/Sql/LogMaintenance.cs          | 138 +++++++++++
+ Services/Sql/WildcardMatcher.cs         |  27 ++
+ Views/Backup/Index.cshtml               | 316 ++++++++++++++++++++++++
+ Views/Shared/_Layout.cshtml             |   1 +
+ wwwroot/css/site.css                    |  15 ++
+ 21 files changed, 1467 insertions(+), 2 deletions(-)
+ create mode 100644 Configuration/BackupOptions.cs
+ create mode 100644 Configuration/BackupOptionsValidator.cs
+ create mode 100644 Controllers/BackupController.cs
+ create mode 100644 Database/004_Backup.sql
+ create mode 100644 Models/BackupIndexViewModel.cs
+ create mode 100644 Models/BackupModels.cs
+ create mode 100644 Services/Backup/BackupNotifier.cs
+ create mode 100644 Services/Backup/BackupRunner.cs
+ create mode 100644 Services/Backup/BackupService.cs
+ create mode 100644 Services/Sql/LogMaintenance.cs
+ create mode 100644 Services/Sql/WildcardMatcher.cs
+ create mode 100644 Views/Backup/Index.cshtml
+
+diff --git a/.gitignore b/.gitignore
+index 9491a2f..feeb67e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -360,4 +360,7 @@ MigrationBackup/
+ .ionide/
+ 
+ # Fody - auto-generated XML schema
+-FodyWeavers.xsd
+\ No newline at end of file
++FodyWeavers.xsd
++# Pastas do projeto que colidem com o padrão Backup*/ acima
++!Services/Backup/
++!Views/Backup/
+diff --git a/Configuration/BackupOptions.cs b/Configuration/BackupOptions.cs
+new file mode 100644
+index 0000000..2f3c841
+--- /dev/null
++++ b/Configuration/BackupOptions.cs
+@@ -0,0 +1,35 @@
++namespace SqlRestoreManager.Configuration;
++
++/// <summary>
++/// Backup dos bancos de usuário (seção "Backup").
++/// Bancos de sistema nunca entram.
++/// </summary>
++public sealed class BackupOptions
++{
++    public const string SectionName = "Backup";
++
++    /// <summary>Habilita a aba e a execução de backups.</summary>
++    public bool Enabled { get; set; } = true;
++
++    /// <summary>Pasta dos arquivos .bak, vista pelo SQL Server.</summary>
++    public string? Path { get; set; }
++
++    /// <summary>Bancos que não devem entrar no backup. Aceita curingas (* e ?).</summary>
++    public List<string> ExcludedDatabases { get; set; } = new();
++
++    public bool Compression { get; set; } = true;
++
++    public bool Checksum { get; set; } = true;
++
++    /// <summary>Apaga .bak mais antigos que N dias após a execução. 0 = nunca.</summary>
++    public int RetentionDays { get; set; } = 7;
++
++    /// <summary>Coloca em RECOVERY SIMPLE e reduz o log antes do backup.</summary>
++    public bool ShrinkLogBefore { get; set; } = true;
++
++    public int LogTargetSizeMB { get; set; } = 512;
++
++    public int LogGrowthMB { get; set; } = 256;
++
++    public int CommandTimeoutMinutes { get; set; } = 120;
++}
+diff --git a/Configuration/BackupOptionsValidator.cs b/Configuration/BackupOptionsValidator.cs
+new file mode 100644
+index 0000000..14b78be
+--- /dev/null
++++ b/Configuration/BackupOptionsValidator.cs
+@@ -0,0 +1,44 @@
++using System.Text.RegularExpressions;
++using Microsoft.Extensions.Options;
++
++namespace SqlRestoreManager.Configuration;
++
++public sealed partial class BackupOptionsValidator : IValidateOptions<BackupOptions>
++{
++    public ValidateOptionsResult Validate(string? name, BackupOptions o)
++    {
++        var errors = new List<string>();
++
++        if (o.Enabled && string.IsNullOrWhiteSpace(o.Path))
++            errors.Add("Backup:Path é obrigatório quando Backup:Enabled = true.");
++
++        if (!string.IsNullOrWhiteSpace(o.Path) && !WindowsAbsolutePathRegex().IsMatch(o.Path))
++            errors.Add("Backup:Path deve ser um caminho absoluto Windows visto pelo SQL Server.");
++
++        if (o.RetentionDays is < 0 or > 3650)
++            errors.Add("Backup:RetentionDays deve estar entre 0 e 3650.");
++
++        if (o.LogTargetSizeMB is < 1 or > 1_048_576)
++            errors.Add("Backup:LogTargetSizeMB deve estar entre 1 e 1048576.");
++
++        if (o.LogGrowthMB is < 0 or > 10_240)
++            errors.Add("Backup:LogGrowthMB deve estar entre 0 e 10240.");
++
++        if (o.CommandTimeoutMinutes is < 1 or > 1440)
++            errors.Add("Backup:CommandTimeoutMinutes deve estar entre 1 e 1440.");
++
++        foreach (var pattern in o.ExcludedDatabases)
++        {
++            if (string.IsNullOrWhiteSpace(pattern) || !PatternRegex().IsMatch(pattern))
++                errors.Add($"Backup:ExcludedDatabases contém padrão inválido: '{pattern}'.");
++        }
++
++        return errors.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(errors);
++    }
++
++    [GeneratedRegex(@"^[\p{L}\p{N}_\-\. \*\?]{1,128}$")]
++    private static partial Regex PatternRegex();
++
++    [GeneratedRegex(@"^([A-Za-z]:\\|\\\\[^\\]+\\[^\\]+)")]
++    private static partial Regex WindowsAbsolutePathRegex();
++}
+diff --git a/Controllers/BackupController.cs b/Controllers/BackupController.cs
+new file mode 100644
+index 0000000..5fdff23
+--- /dev/null
++++ b/Controllers/BackupController.cs
+@@ -0,0 +1,114 @@
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Options;
++using SqlRestoreManager.Configuration;
++using SqlRestoreManager.Data;
++using SqlRestoreManager.Models;
++using SqlRestoreManager.Services.Backup;
++using SqlRestoreManager.Services.Sql;
++
++namespace SqlRestoreManager.Controllers;
++
++public sealed class BackupController : Controller
++{
++    private const int RecentRuns = 10;
++
++    private readonly AppDbContext _db;
++    private readonly BackupService _service;
++    private readonly BackupRunner _runner;
++    private readonly BackupOptions _options;
++    private readonly ILogger<BackupController> _logger;
++
++    public BackupController(
++        AppDbContext db,
++        BackupService service,
++        BackupRunner runner,
++        IOptions<BackupOptions> options,
++        ILogger<BackupController> logger)
++    {
++        _db = db;
++        _service = service;
++        _runner = runner;
++        _options = options.Value;
++        _logger = logger;
++    }
++
++    [HttpGet]
++    public async Task<IActionResult> Index(CancellationToken ct)
++    {
++        var runs = await _db.BackupRuns
++            .AsNoTracking()
++            .Include(x => x.Items)
++            .OrderByDescending(x => x.StartedAt)
++            .Take(RecentRuns)
++            .ToListAsync(ct);
++
++        BackupIndexViewModel Build(IReadOnlyList<BackupTarget> targets, string? error) => new()
++        {
++            Enabled = _options.Enabled,
++            RestoreInProgress = _runner.RestoreInProgress,
++            BackupInProgress = _runner.IsRunning,
++            CurrentRunId = _runner.CurrentRunId,
++            BackupPath = _options.Path,
++            RetentionDays = _options.RetentionDays,
++            ShrinkLogBefore = _options.ShrinkLogBefore,
++            Runs = runs,
++            Targets = targets,
++            LoadError = error
++        };
++
++        if (!_options.Enabled)
++            return View(Build([], null));
++
++        try
++        {
++            return View(Build(await _service.ListTargetsAsync(ct), null));
++        }
++        catch (Exception ex) when (!ct.IsCancellationRequested)
++        {
++            _logger.LogError(ex, "Falha ao listar os bancos para backup.");
++            return View(Build([], SqlErrorTranslator.Translate(ex)));
++        }
++    }
++
++    [HttpPost]
++    public async Task<IActionResult> Start([FromForm] string[]? databases, CancellationToken ct)
++    {
++        try
++        {
++            var runId = await _runner.StartAsync(databases ?? [], BackupTrigger.Manual, ct);
++            return Json(new { runId });
++        }
++        catch (RestoreValidationException ex)
++        {
++            return StatusCode(ex.StatusCode, ex.Message);
++        }
++        catch (Exception ex) when (!ct.IsCancellationRequested)
++        {
++            _logger.LogError(ex, "Falha ao iniciar o backup.");
++            return StatusCode(StatusCodes.Status503ServiceUnavailable, SqlErrorTranslator.Translate(ex));
++        }
++    }
++
++    [HttpGet]
++    public async Task<IActionResult> Status(Guid runId, CancellationToken ct)
++    {
++        var run = await _db.BackupRuns
++            .AsNoTracking()
++            .Where(x => x.RunId == runId)
++            .Select(x => new
++            {
++                x.RunId,
++                x.Status,
++                x.CurrentStep,
++                x.PercentComplete,
++                x.TotalDatabases,
++                x.SucceededCount,
++                x.FailedCount,
++                x.ErrorMessage
++            })
++            .SingleOrDefaultAsync(ct);
++
++        return run is null ? NotFound() : Json(run);
++    }
++}
+diff --git a/Controllers/RestoreController.cs b/Controllers/RestoreController.cs
+index a2cbaa4..bfa84c1 100644
+--- a/Controllers/RestoreController.cs
++++ b/Controllers/RestoreController.cs
+@@ -6,6 +6,7 @@ using SqlRestoreManager.Configuration;
+ using SqlRestoreManager.Data;
+ using SqlRestoreManager.Filters;
+ using SqlRestoreManager.Models;
++using SqlRestoreManager.Services.Backup;
+ using SqlRestoreManager.Services.Jobs;
+ using SqlRestoreManager.Services.Sql;
+ using SqlRestoreManager.Services.Uploads;
+@@ -24,6 +25,7 @@ public sealed class RestoreController : Controller
+     private readonly SqlRestoreService _sql;
+     private readonly BackupUploadService _uploads;
+     private readonly BackupLibrary _library;
++    private readonly BackupRunner _backups;
+     private readonly BackupExtractor _extractor;
+     private readonly RestoreOptions _options;
+     private readonly ILogger<RestoreController> _logger;
+@@ -36,6 +38,7 @@ public sealed class RestoreController : Controller
+         SqlRestoreService sql,
+         BackupUploadService uploads,
+         BackupLibrary library,
++        BackupRunner backups,
+         BackupExtractor extractor,
+         IOptions<RestoreOptions> options,
+         ILogger<RestoreController> logger)
+@@ -47,6 +50,7 @@ public sealed class RestoreController : Controller
+         _sql = sql;
+         _uploads = uploads;
+         _library = library;
++        _backups = backups;
+         _extractor = extractor;
+         _options = options.Value;
+         _logger = logger;
+@@ -135,6 +139,9 @@ public sealed class RestoreController : Controller
+             return StatusCode(StatusCodes.Status503ServiceUnavailable, SqlErrorTranslator.Translate(ex));
+         }
+ 
++        if (_backups.IsRunning)
++            return Conflict("Há um backup em andamento. Aguarde o término para restaurar.");
++
+         var jobId = Guid.NewGuid();
+         if (!_queue.TryReserve(database, jobId))
+             return Conflict($"Já existe um restore na fila ou em andamento para '{database}'.");
+@@ -264,6 +271,9 @@ public sealed class RestoreController : Controller
+ 
+         ConfigureRequestBodyLimit();
+ 
++        if (_backups.IsRunning)
++            return Conflict("Há um backup em andamento. Aguarde o término para restaurar.");
++
+         var jobId = Guid.NewGuid();
+         if (!_queue.TryReserve(database, jobId))
+             return Conflict($"Já existe um restore na fila ou em andamento para '{database}'.");
+diff --git a/Data/AppDbContext.cs b/Data/AppDbContext.cs
+index ae4feee..6261a3d 100644
+--- a/Data/AppDbContext.cs
++++ b/Data/AppDbContext.cs
+@@ -8,6 +8,8 @@ public class AppDbContext : DbContext
+     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+ 
+     public DbSet<RestoreHistory> RestoreHistory => Set<RestoreHistory>();
++    public DbSet<BackupRun> BackupRuns => Set<BackupRun>();
++    public DbSet<BackupItem> BackupItems => Set<BackupItem>();
+ 
+     protected override void OnModelCreating(ModelBuilder modelBuilder)
+     {
+@@ -36,5 +38,38 @@ public class AppDbContext : DbContext
+             e.HasIndex(x => x.JobId).IsUnique().HasDatabaseName("UX_RestoreHistory_JobId");
+             e.HasIndex(x => x.StartedAt).HasDatabaseName("IX_RestoreHistory_StartedAt");
+         });
++
++        modelBuilder.Entity<BackupRun>(e =>
++        {
++            e.ToTable("BackupRun", "dbo");
++            e.HasKey(x => x.Id).HasName("PK_BackupRun");
++            e.Property(x => x.Trigger).HasMaxLength(20).IsRequired();
++            e.Property(x => x.Status).HasMaxLength(50).IsRequired();
++            e.Property(x => x.CurrentStep).HasMaxLength(300);
++            e.Property(x => x.NodeName).HasMaxLength(128);
++            e.Property(x => x.ErrorMessage).HasMaxLength(4000);
++            e.Property(x => x.StartedAt).HasColumnType("datetime2");
++            e.Property(x => x.FinishedAt).HasColumnType("datetime2");
++            e.HasIndex(x => x.RunId).IsUnique().HasDatabaseName("UX_BackupRun_RunId");
++            e.HasIndex(x => x.StartedAt).HasDatabaseName("IX_BackupRun_StartedAt");
++            e.HasMany(x => x.Items)
++             .WithOne()
++             .HasForeignKey(x => x.RunId)
++             .HasPrincipalKey(x => x.RunId);
++        });
++
++        modelBuilder.Entity<BackupItem>(e =>
++        {
++            e.ToTable("BackupItem", "dbo");
++            e.HasKey(x => x.Id).HasName("PK_BackupItem");
++            e.Property(x => x.DatabaseName).HasMaxLength(128).IsRequired();
++            e.Property(x => x.Status).HasMaxLength(50).IsRequired();
++            e.Property(x => x.FilePath).HasMaxLength(512);
++            e.Property(x => x.ErrorMessage).HasMaxLength(4000);
++            e.Property(x => x.StartedAt).HasColumnType("datetime2");
++            e.Property(x => x.FinishedAt).HasColumnType("datetime2");
++            e.Ignore(x => x.DurationSeconds);
++            e.HasIndex(x => x.RunId).HasDatabaseName("IX_BackupItem_RunId");
++        });
+     }
+ }
+diff --git a/Database/004_Backup.sql b/Database/004_Backup.sql
+new file mode 100644
+index 0000000..f463590
+--- /dev/null
++++ b/Database/004_Backup.sql
+@@ -0,0 +1,121 @@
++/* =============================================================================
++   SqlRestoreManager - Módulo de backup
++   Script: 004_Backup.sql  (idempotente)
++   Cria dbo.BackupRun (execução) e dbo.BackupItem (cada banco da execução).
++   ============================================================================= */
++SET NOCOUNT ON;
++GO
++
++USE RestoreManager;
++GO
++
++IF OBJECT_ID(N'dbo.BackupRun', N'U') IS NULL
++BEGIN
++    CREATE TABLE dbo.BackupRun
++    (
++        Id              bigint IDENTITY(1,1) NOT NULL,
++        RunId           uniqueidentifier     NOT NULL,
++        [Trigger]       nvarchar(20)         NOT NULL,
++        Status          nvarchar(50)         NOT NULL,
++        CurrentStep     nvarchar(300)        NULL,
++        PercentComplete int                  NOT NULL,
++        TotalDatabases  int                  NOT NULL,
++        SucceededCount  int                  NOT NULL,
++        FailedCount     int                  NOT NULL,
++        TotalSizeBytes  bigint               NOT NULL,
++        NodeName        nvarchar(128)        NULL,
++        StartedAt       datetime2(7)         NOT NULL,
++        FinishedAt      datetime2(7)         NULL,
++        ErrorMessage    nvarchar(4000)       NULL,
++        CONSTRAINT PK_BackupRun PRIMARY KEY CLUSTERED (Id),
++        CONSTRAINT UQ_BackupRun_RunId UNIQUE (RunId)
++    );
++END
++GO
++
++IF OBJECT_ID(N'dbo.BackupItem', N'U') IS NULL
++BEGIN
++    CREATE TABLE dbo.BackupItem
++    (
++        Id              bigint IDENTITY(1,1) NOT NULL,
++        RunId           uniqueidentifier     NOT NULL,
++        DatabaseName    nvarchar(128)        NOT NULL,
++        Status          nvarchar(50)         NOT NULL,
++        FilePath        nvarchar(512)        NULL,
++        SizeBytes       bigint               NOT NULL,
++        LogSizeBeforeMB int                  NULL,
++        LogSizeAfterMB  int                  NULL,
++        StartedAt       datetime2(7)         NOT NULL,
++        FinishedAt      datetime2(7)         NULL,
++        ErrorMessage    nvarchar(4000)       NULL,
++        CONSTRAINT PK_BackupItem PRIMARY KEY CLUSTERED (Id),
++        CONSTRAINT FK_BackupItem_BackupRun FOREIGN KEY (RunId)
++            REFERENCES dbo.BackupRun (RunId) ON DELETE CASCADE
++    );
++END
++GO
++
++IF NOT EXISTS (SELECT 1 FROM sys.indexes
++               WHERE object_id = OBJECT_ID(N'dbo.BackupRun') AND name = N'UX_BackupRun_RunId')
++    CREATE UNIQUE NONCLUSTERED INDEX UX_BackupRun_RunId ON dbo.BackupRun (RunId);
++
++IF NOT EXISTS (SELECT 1 FROM sys.indexes
++               WHERE object_id = OBJECT_ID(N'dbo.BackupRun') AND name = N'IX_BackupRun_StartedAt')
++    CREATE NONCLUSTERED INDEX IX_BackupRun_StartedAt ON dbo.BackupRun (StartedAt);
++
++IF NOT EXISTS (SELECT 1 FROM sys.indexes
++               WHERE object_id = OBJECT_ID(N'dbo.BackupItem') AND name = N'IX_BackupItem_RunId')
++    CREATE NONCLUSTERED INDEX IX_BackupItem_RunId ON dbo.BackupItem (RunId);
++GO
++
++/* ----------------------------------------------- Documentação das colunas */
++DECLARE @props TABLE (TableName sysname NOT NULL, ColumnName sysname NULL, Description nvarchar(500) NOT NULL);
++INSERT INTO @props VALUES
++ (N'BackupRun',  NULL,               N'Execuções do backup (manual ou agendado).'),
++ (N'BackupRun',  N'RunId',           N'Identificador da execução (SignalR e itens).'),
++ (N'BackupRun',  N'Trigger',         N'Manual ou Scheduled.'),
++ (N'BackupRun',  N'Status',          N'Running, Success, Warning ou Error.'),
++ (N'BackupRun',  N'TotalDatabases',  N'Quantidade de bancos selecionados.'),
++ (N'BackupRun',  N'SucceededCount',  N'Bancos copiados com sucesso.'),
++ (N'BackupRun',  N'FailedCount',     N'Bancos com falha.'),
++ (N'BackupRun',  N'TotalSizeBytes',  N'Soma dos arquivos gerados, em bytes.'),
++ (N'BackupRun',  N'NodeName',        N'Instância do SqlRestoreManager que executou.'),
++ (N'BackupItem', NULL,               N'Backup de um banco dentro da execução.'),
++ (N'BackupItem', N'RunId',           N'Execução a que pertence.'),
++ (N'BackupItem', N'FilePath',        N'Arquivo .bak gerado.'),
++ (N'BackupItem', N'SizeBytes',       N'Tamanho do backup, em bytes.'),
++ (N'BackupItem', N'LogSizeBeforeMB', N'Tamanho do log antes da limpeza.'),
++ (N'BackupItem', N'LogSizeAfterMB',  N'Tamanho do log após a limpeza.');
++
++DECLARE @tbl sysname, @col sysname, @desc nvarchar(500), @l2type varchar(128), @minor int, @major int;
++DECLARE props CURSOR LOCAL FAST_FORWARD FOR SELECT TableName, ColumnName, Description FROM @props;
++OPEN props;
++FETCH NEXT FROM props INTO @tbl, @col, @desc;
++WHILE @@FETCH_STATUS = 0
++BEGIN
++    SET @major = OBJECT_ID(N'dbo.' + QUOTENAME(@tbl));
++    SET @l2type = CASE WHEN @col IS NULL THEN NULL ELSE 'COLUMN' END;
++    SET @minor = CASE WHEN @col IS NULL THEN 0 ELSE COLUMNPROPERTY(@major, @col, 'ColumnId') END;
++
++    IF EXISTS (SELECT 1 FROM sys.extended_properties
++               WHERE class = 1 AND major_id = @major AND minor_id = @minor AND name = N'MS_Description')
++        EXEC sys.sp_updateextendedproperty
++             @name = N'MS_Description', @value = @desc,
++             @level0type = N'SCHEMA', @level0name = N'dbo',
++             @level1type = N'TABLE',  @level1name = @tbl,
++             @level2type = @l2type,   @level2name = @col;
++    ELSE
++        EXEC sys.sp_addextendedproperty
++             @name = N'MS_Description', @value = @desc,
++             @level0type = N'SCHEMA', @level0name = N'dbo',
++             @level1type = N'TABLE',  @level1name = @tbl,
++             @level2type = @l2type,   @level2name = @col;
++
++    FETCH NEXT FROM props INTO @tbl, @col, @desc;
++END
++CLOSE props;
++DEALLOCATE props;
++GO
++
++PRINT 'dbo.BackupRun e dbo.BackupItem prontas.';
++GO
+diff --git a/Models/BackupIndexViewModel.cs b/Models/BackupIndexViewModel.cs
+new file mode 100644
+index 0000000..f400ef6
+--- /dev/null
++++ b/Models/BackupIndexViewModel.cs
+@@ -0,0 +1,17 @@
++using SqlRestoreManager.Services.Backup;
++
++namespace SqlRestoreManager.Models;
++
++public sealed class BackupIndexViewModel
++{
++    public IReadOnlyList<BackupTarget> Targets { get; init; } = [];
++    public IReadOnlyList<BackupRun> Runs { get; init; } = [];
++    public bool Enabled { get; init; }
++    public bool RestoreInProgress { get; init; }
++    public bool BackupInProgress { get; init; }
++    public Guid? CurrentRunId { get; init; }
++    public string? BackupPath { get; init; }
++    public int RetentionDays { get; init; }
++    public bool ShrinkLogBefore { get; init; }
++    public string? LoadError { get; init; }
++}
+diff --git a/Models/BackupModels.cs b/Models/BackupModels.cs
+new file mode 100644
+index 0000000..8b6e1a6
+--- /dev/null
++++ b/Models/BackupModels.cs
+@@ -0,0 +1,68 @@
++namespace SqlRestoreManager.Models;
++
++/// <summary>Status de BackupRun/BackupItem.</summary>
++public static class BackupStatus
++{
++    public const string Running = "Running";
++    public const string Success = "Success";
++    public const string Warning = "Warning";
++    public const string Error = "Error";
++    public const string Skipped = "Skipped";
++
++    public static bool IsActive(string status) => status == Running;
++
++    public static string ToLabel(string status) => status switch
++    {
++        Running => "Em andamento",
++        Success => "Concluído",
++        Warning => "Concluído com falhas",
++        Error => "Erro",
++        Skipped => "Ignorado",
++        _ => status
++    };
++}
++
++public static class BackupTrigger
++{
++    public const string Manual = "Manual";
++    public const string Scheduled = "Scheduled";
++}
++
++/// <summary>Uma execução do backup (dbo.BackupRun).</summary>
++public class BackupRun
++{
++    public long Id { get; set; }
++    public Guid RunId { get; set; }
++    public string Trigger { get; set; } = BackupTrigger.Manual;
++    public string Status { get; set; } = BackupStatus.Running;
++    public string? CurrentStep { get; set; }
++    public int PercentComplete { get; set; }
++    public int TotalDatabases { get; set; }
++    public int SucceededCount { get; set; }
++    public int FailedCount { get; set; }
++    public long TotalSizeBytes { get; set; }
++    public string? NodeName { get; set; }
++    public DateTime StartedAt { get; set; }
++    public DateTime? FinishedAt { get; set; }
++    public string? ErrorMessage { get; set; }
++
++    public List<BackupItem> Items { get; set; } = new();
++}
++
++/// <summary>Backup de um banco dentro da execução (dbo.BackupItem).</summary>
++public class BackupItem
++{
++    public long Id { get; set; }
++    public Guid RunId { get; set; }
++    public string DatabaseName { get; set; } = string.Empty;
++    public string Status { get; set; } = BackupStatus.Running;
++    public string? FilePath { get; set; }
++    public long SizeBytes { get; set; }
++    public int? LogSizeBeforeMB { get; set; }
++    public int? LogSizeAfterMB { get; set; }
++    public DateTime StartedAt { get; set; }
++    public DateTime? FinishedAt { get; set; }
++    public string? ErrorMessage { get; set; }
++
++    public double DurationSeconds => ((FinishedAt ?? DateTime.Now) - StartedAt).TotalSeconds;
++}
+diff --git a/Program.cs b/Program.cs
+index 8ac9d86..c204a72 100644
+--- a/Program.cs
++++ b/Program.cs
+@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Options;
+ using SqlRestoreManager.Configuration;
+ using SqlRestoreManager.Data;
++using SqlRestoreManager.Services.Backup;
+ using SqlRestoreManager.Services.Jobs;
+ using SqlRestoreManager.Services.Notifications;
+ using SqlRestoreManager.Services.Sql;
+@@ -20,6 +21,12 @@ builder.Services
+     .ValidateOnStart();
+ builder.Services.AddSingleton<IValidateOptions<RestoreOptions>, RestoreOptionsValidator>();
+ 
++builder.Services
++    .AddOptions<BackupOptions>()
++    .Bind(builder.Configuration.GetSection(BackupOptions.SectionName))
++    .ValidateOnStart();
++builder.Services.AddSingleton<IValidateOptions<BackupOptions>, BackupOptionsValidator>();
++
+ // Exceção em BackgroundService não derruba a aplicação; tempo extra no shutdown.
+ builder.Services.Configure<HostOptions>(o =>
+ {
+@@ -43,6 +50,10 @@ builder.Services.AddSingleton<DatabaseCatalog>();
+ builder.Services.AddSingleton<BackupPathMapper>();
+ builder.Services.AddSingleton<SqlRestoreService>();
+ builder.Services.AddSingleton<PostRestoreService>();
++builder.Services.AddSingleton<LogMaintenance>();
++builder.Services.AddSingleton<BackupService>();
++builder.Services.AddSingleton<BackupNotifier>();
++builder.Services.AddSingleton<BackupRunner>();
+ builder.Services.AddSingleton<BackupExtractor>();
+ builder.Services.AddSingleton<BackupLibrary>();
+ builder.Services.AddSingleton<BackupUploadService>();
+diff --git a/README.md b/README.md
+index f53979e..f008955 100644
+--- a/README.md
++++ b/README.md
+@@ -39,6 +39,13 @@ se encarrega de aceitar o que vier, restaurar com segurança e deixar o banco pr
+ - Corrige usuários órfãos.
+ - Executa scripts `.sql` seus, globais ou por banco.
+ 
++**Backup dos bancos**
++- Aba própria, com seleção dos bancos de usuário (sistema nunca entra).
++- Limpeza do log antes de cada backup e `BACKUP ... WITH COPY_ONLY, COMPRESSION, CHECKSUM`.
++- Arquivos no padrão `banco_DDMMAAAA_HHmm.bak`, com retenção automática.
++- Backup e restore nunca rodam ao mesmo tempo.
++- Histórico por execução e por banco, com tamanho, duração e erro.
++
+ **Histórico**
+ - Registro completo de cada job, com etapas, alertas e tamanho do log antes e depois.
+ - Busca, filtro por status, paginação e exportação CSV.
+@@ -61,7 +68,7 @@ se encarrega de aceitar o que vier, restaurar com segurança e deixar o banco pr
+ 
+ 1. **Banco de histórico** — execute, em ordem, os scripts de `Database/`:
+    `001_RestoreHistory.sql`, `002_RestoreHistory_PostRestore.sql`,
+-   `003_RestoreHistory_SafetyBackup.sql`. São idempotentes.
++   `003_RestoreHistory_SafetyBackup.sql` e `004_Backup.sql`. São idempotentes.
+ 2. **Pastas** — crie a pasta temporária e, se for usar, a de backups e a de backups de segurança.
+    A conta do serviço SQL Server precisa de leitura na pasta temporária e de escrita nas pastas
+    de dados e log.
+@@ -116,6 +123,19 @@ O `web.config` do projeto já libera uploads de até ~4 GB (o padrão do IIS é
+ 
+ Configuração inválida impede a aplicação de subir (`ValidateOnStart`), com a mensagem do que corrigir.
+ 
++## Backup (`Backup`)
++
++| Chave | Padrão | Descrição |
++|---|---|---|
++| `Enabled` | `true` | Habilita a aba e a execução. |
++| `Path` | vazio | Pasta dos `.bak`, vista pelo SQL Server. Obrigatória quando habilitado. |
++| `ExcludedDatabases` | vazio | Bancos fora do backup. Aceita `*` e `?`. |
++| `Compression` / `Checksum` | `true` | Opções do `BACKUP`. |
++| `RetentionDays` | `7` | Apaga `.bak` mais antigos ao final da execução. 0 = nunca. |
++| `ShrinkLogBefore` | `true` | `RECOVERY SIMPLE` + shrink do log antes de cada backup. |
++| `LogTargetSizeMB` / `LogGrowthMB` | `512` / `256` | Alvo e crescimento do log. |
++| `CommandTimeoutMinutes` | `120` | Timeout dos comandos. |
++
+ ## Aplicação em outra máquina (desenvolvimento)
+ 
+ Quando a aplicação roda fora do servidor SQL, quem grava o arquivo é a aplicação, mas quem o lê é o
+diff --git a/Services/Backup/BackupNotifier.cs b/Services/Backup/BackupNotifier.cs
+new file mode 100644
+index 0000000..1703462
+--- /dev/null
++++ b/Services/Backup/BackupNotifier.cs
+@@ -0,0 +1,44 @@
++using Microsoft.AspNetCore.SignalR;
++using SqlRestoreManager.Services.Notifications;
++
++namespace SqlRestoreManager.Services.Backup;
++
++public sealed record BackupProgressMessage(Guid RunId, string Status, string Message, int Percent);
++
++public sealed record BackupResultMessage(Guid RunId, string Message, bool HasWarnings = false);
++
++/// <summary>Eventos da execução de backup, no grupo do RunId.</summary>
++public sealed class BackupNotifier
++{
++    private readonly IHubContext<RestoreHub> _hub;
++    private readonly ILogger<BackupNotifier> _logger;
++
++    public BackupNotifier(IHubContext<RestoreHub> hub, ILogger<BackupNotifier> logger)
++    {
++        _hub = hub;
++        _logger = logger;
++    }
++
++    public static string GroupName(Guid runId) => $"backup:{runId:N}";
++
++    public Task ProgressAsync(Guid runId, string status, string message, int percent) =>
++        SendAsync(runId, "BackupProgress", new BackupProgressMessage(runId, status, message, percent));
++
++    public Task CompletedAsync(Guid runId, string message, bool hasWarnings) =>
++        SendAsync(runId, "BackupCompleted", new BackupResultMessage(runId, message, hasWarnings));
++
++    public Task FailedAsync(Guid runId, string message) =>
++        SendAsync(runId, "BackupFailed", new BackupResultMessage(runId, message));
++
++    private async Task SendAsync(Guid runId, string method, object payload)
++    {
++        try
++        {
++            await _hub.Clients.Group(GroupName(runId)).SendAsync(method, payload, CancellationToken.None);
++        }
++        catch (Exception ex)
++        {
++            _logger.LogWarning(ex, "Falha ao enviar {Method} do backup {RunId}.", method, runId);
++        }
++    }
++}
+diff --git a/Services/Backup/BackupRunner.cs b/Services/Backup/BackupRunner.cs
+new file mode 100644
+index 0000000..152039c
+--- /dev/null
++++ b/Services/Backup/BackupRunner.cs
+@@ -0,0 +1,262 @@
++using System.Runtime.CompilerServices;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Options;
++using SqlRestoreManager.Configuration;
++using SqlRestoreManager.Data;
++using SqlRestoreManager.Models;
++using SqlRestoreManager.Services.Jobs;
++using SqlRestoreManager.Services.Notifications;
++using SqlRestoreManager.Services.Sql;
++
++namespace SqlRestoreManager.Services.Backup;
++
++/// <summary>
++/// Orquestra uma execução de backup: uma por vez, nunca junto de um restore.
++/// </summary>
++public sealed class BackupRunner
++{
++    private readonly SemaphoreSlim _gate = new(1, 1);
++    private readonly IServiceScopeFactory _scopeFactory;
++    private readonly RestoreQueue _restoreQueue;
++    private readonly BackupOptions _options;
++    private readonly RestoreOptions _restoreOptions;
++    private readonly ILogger<BackupRunner> _logger;
++
++    private volatile bool _running;
++
++    public BackupRunner(
++        IServiceScopeFactory scopeFactory,
++        RestoreQueue restoreQueue,
++        IOptions<BackupOptions> options,
++        IOptions<RestoreOptions> restoreOptions,
++        ILogger<BackupRunner> logger)
++    {
++        _scopeFactory = scopeFactory;
++        _restoreQueue = restoreQueue;
++        _options = options.Value;
++        _restoreOptions = restoreOptions.Value;
++        _logger = logger;
++    }
++
++    public bool IsRunning => _running;
++
++    public Guid? CurrentRunId { get; private set; }
++
++    /// <summary>Backup e restore nunca rodam ao mesmo tempo.</summary>
++    public bool RestoreInProgress => _restoreQueue.HasActiveJobs;
++
++    /// <summary>
++    /// Inicia a execução em segundo plano e devolve o RunId.
++    /// </summary>
++    public async Task<Guid> StartAsync(IReadOnlyList<string> databases, string trigger, CancellationToken ct)
++    {
++        if (!_options.Enabled)
++            throw new RestoreValidationException("O módulo de backup está desabilitado (Backup:Enabled).");
++
++        if (RestoreInProgress)
++            throw new RestoreValidationException(
++                "Há um restore em andamento. Aguarde o término para iniciar o backup.",
++                StatusCodes.Status409Conflict);
++
++        if (!await _gate.WaitAsync(0, ct))
++            throw new RestoreValidationException(
++                "Já existe um backup em andamento.", StatusCodes.Status409Conflict);
++
++        var runId = Guid.NewGuid();
++        try
++        {
++            using var scope = _scopeFactory.CreateScope();
++            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
++            var service = scope.ServiceProvider.GetRequiredService<BackupService>();
++
++            var targets = (await service.ListTargetsAsync(ct))
++                .Where(t => databases.Count == 0 ||
++                            databases.Any(d => string.Equals(d, t.Name, StringComparison.OrdinalIgnoreCase)))
++                .Select(t => t.Name)
++                .ToList();
++
++            if (targets.Count == 0)
++                throw new RestoreValidationException("Nenhum banco selecionado para backup.");
++
++            db.BackupRuns.Add(new BackupRun
++            {
++                RunId = runId,
++                Trigger = trigger,
++                Status = BackupStatus.Running,
++                CurrentStep = "Na fila...",
++                TotalDatabases = targets.Count,
++                NodeName = _restoreOptions.EffectiveNodeName,
++                StartedAt = DateTime.Now
++            });
++            await db.SaveChangesAsync(ct);
++
++            _running = true;
++            CurrentRunId = runId;
++
++            // Continua em segundo plano: a requisição HTTP não espera o backup terminar.
++            _ = Task.Run(() => ExecuteAsync(runId, targets), CancellationToken.None);
++            return runId;
++        }
++        catch
++        {
++            _gate.Release();
++            throw;
++        }
++    }
++
++    private async Task ExecuteAsync(Guid runId, IReadOnlyList<string> databases)
++    {
++        using var scope = _scopeFactory.CreateScope();
++        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
++        var service = scope.ServiceProvider.GetRequiredService<BackupService>();
++        var logs = scope.ServiceProvider.GetRequiredService<LogMaintenance>();
++        var notifier = scope.ServiceProvider.GetRequiredService<BackupNotifier>();
++        var progress = scope.ServiceProvider.GetRequiredService<SqlRestoreService>();
++
++        var run = await db.BackupRuns.SingleAsync(x => x.RunId == runId);
++
++        try
++        {
++            for (var i = 0; i < databases.Count; i++)
++            {
++                var database = databases[i];
++                var basePercent = (int)(i * 100d / databases.Count);
++
++                var item = new BackupItem
++                {
++                    RunId = runId,
++                    DatabaseName = database,
++                    Status = BackupStatus.Running,
++                    StartedAt = DateTime.Now
++                };
++                db.BackupItems.Add(item);
++
++                run.CurrentStep = $"({i + 1}/{databases.Count}) {database}";
++                run.PercentComplete = basePercent;
++                await db.SaveChangesAsync();
++                await notifier.ProgressAsync(runId, run.Status, run.CurrentStep, basePercent);
++
++                try
++                {
++                    await service.ResolveTargetAsync(database);
++
++                    if (_options.ShrinkLogBefore)
++                    {
++                        await notifier.ProgressAsync(runId, run.Status,
++                            $"({i + 1}/{databases.Count}) {database}: reduzindo log...", basePercent);
++
++                        var shrink = await logs.ShrinkAsync(database, _options.LogTargetSizeMB,
++                            _options.LogGrowthMB, setRecoverySimple: true, _options.CommandTimeoutMinutes * 60);
++
++                        item.LogSizeBeforeMB = shrink.BeforeMB;
++                        item.LogSizeAfterMB = shrink.AfterMB;
++                        await db.SaveChangesAsync();
++                    }
++
++                    var sessionId = new StrongBox<int>(0);
++                    var task = service.BackupAsync(database, spid => Volatile.Write(ref sessionId.Value, spid));
++
++                    await TrackProgressAsync(task, sessionId, progress, notifier, runId, run, database,
++                        i, databases.Count, db);
++
++                    var file = await task;
++                    item.FilePath = file.Path;
++                    item.SizeBytes = file.SizeBytes;
++                    item.Status = BackupStatus.Success;
++                    item.FinishedAt = DateTime.Now;
++
++                    run.SucceededCount++;
++                    run.TotalSizeBytes += file.SizeBytes;
++                }
++                catch (Exception ex)
++                {
++                    _logger.LogError(ex, "Falha no backup de {Database}.", database);
++                    item.Status = BackupStatus.Error;
++                    item.ErrorMessage = Truncate(SqlErrorTranslator.Translate(ex), 4000);
++                    item.FinishedAt = DateTime.Now;
++                    run.FailedCount++;
++                }
++
++                await db.SaveChangesAsync();
++            }
++
++            try
++            {
++                await service.CleanupAsync();
++            }
++            catch (Exception ex)
++            {
++                _logger.LogWarning(ex, "Falha ao aplicar a retenção dos backups.");
++            }
++
++            run.Status = run.FailedCount == 0 ? BackupStatus.Success : BackupStatus.Warning;
++            run.CurrentStep = run.FailedCount == 0
++                ? "Backup concluído."
++                : $"Concluído com {run.FailedCount} falha(s).";
++            run.PercentComplete = 100;
++            run.FinishedAt = DateTime.Now;
++            await db.SaveChangesAsync();
++
++            await notifier.CompletedAsync(runId, run.CurrentStep!, run.FailedCount > 0);
++            _logger.LogInformation("Backup {RunId} finalizado: {Ok} ok, {Fail} falha(s).",
++                runId, run.SucceededCount, run.FailedCount);
++        }
++        catch (Exception ex)
++        {
++            _logger.LogError(ex, "Falha geral na execução de backup {RunId}.", runId);
++            run.Status = BackupStatus.Error;
++            run.ErrorMessage = Truncate(SqlErrorTranslator.Translate(ex), 4000);
++            run.FinishedAt = DateTime.Now;
++
++            try { await db.SaveChangesAsync(); } catch { /* já registrado no log */ }
++            await notifier.FailedAsync(runId, run.ErrorMessage ?? "Falha no backup.");
++        }
++        finally
++        {
++            _running = false;
++            CurrentRunId = null;
++            _gate.Release();
++        }
++    }
++
++    private async Task TrackProgressAsync(
++        Task task, StrongBox<int> sessionId, SqlRestoreService progress, BackupNotifier notifier,
++        Guid runId, BackupRun run, string database, int index, int total, AppDbContext db)
++    {
++        var slice = 100d / total;
++        var lastPercent = -1;
++
++        while (!task.IsCompleted)
++        {
++            await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(2)));
++
++            var spid = Volatile.Read(ref sessionId.Value);
++            if (task.IsCompleted || spid == 0)
++                continue;
++
++            try
++            {
++                var percent = await progress.GetRestorePercentAsync(spid);
++                if (percent is null)
++                    continue;
++
++                var mapped = (int)(index * slice + percent.Value * slice / 100d);
++                if (mapped <= lastPercent)
++                    continue;
++
++                lastPercent = mapped;
++                run.PercentComplete = Math.Clamp(mapped, 0, 99);
++                run.CurrentStep = $"({index + 1}/{total}) {database}... {percent.Value:0}%";
++                await db.SaveChangesAsync();
++                await notifier.ProgressAsync(runId, run.Status, run.CurrentStep, run.PercentComplete);
++            }
++            catch (Exception ex)
++            {
++                _logger.LogWarning(ex, "Falha ao consultar progresso do backup; a operação continua.");
++            }
++        }
++    }
++
++    private static string? Truncate(string? value, int max) =>
++        value is null || value.Length <= max ? value : value[..max];
++}
+diff --git a/Services/Backup/BackupService.cs b/Services/Backup/BackupService.cs
+new file mode 100644
+index 0000000..40128fc
+--- /dev/null
++++ b/Services/Backup/BackupService.cs
+@@ -0,0 +1,173 @@
++using System.Data;
++using Microsoft.Data.SqlClient;
++using Microsoft.Extensions.Options;
++using SqlRestoreManager.Configuration;
++using SqlRestoreManager.Services.Sql;
++
++namespace SqlRestoreManager.Services.Backup;
++
++public sealed record BackupTarget(string Name, string State, long SizeMB);
++
++public sealed record BackupFileResult(string Path, long SizeBytes);
++
++/// <summary>Operações de BACKUP no SQL Server.</summary>
++public sealed class BackupService
++{
++    private readonly SqlConnectionFactory _connections;
++    private readonly BackupOptions _options;
++    private readonly WildcardMatcher _excluded;
++    private readonly ILogger<BackupService> _logger;
++
++    public BackupService(
++        SqlConnectionFactory connections, IOptions<BackupOptions> options, ILogger<BackupService> logger)
++    {
++        _connections = connections;
++        _options = options.Value;
++        _excluded = new WildcardMatcher(_options.ExcludedDatabases);
++        _logger = logger;
++    }
++
++    private int TimeoutSeconds => _options.CommandTimeoutMinutes * 60;
++
++    /// <summary>Bancos de usuário elegíveis (exclui sistema, histórico e a lista de exclusões).</summary>
++    public async Task<IReadOnlyList<BackupTarget>> ListTargetsAsync(CancellationToken ct = default)
++    {
++        await using var cn = await _connections.OpenMasterAsync(ct);
++        await using var cmd = cn.CreateCommand();
++        cmd.CommandTimeout = 60;
++        cmd.CommandText = """
++            SELECT d.name,
++                   d.state_desc,
++                   CAST(ISNULL(SUM(CAST(mf.size AS bigint)) * 8 / 1024, 0) AS bigint)
++            FROM sys.databases AS d
++            LEFT JOIN sys.master_files AS mf ON mf.database_id = d.database_id
++            WHERE d.database_id > 4
++              AND d.is_distributor = 0
++            GROUP BY d.name, d.state_desc
++            ORDER BY d.name;
++            """;
++
++        var history = _connections.HistoryDatabaseName;
++        var result = new List<BackupTarget>();
++
++        await using var rd = await cmd.ExecuteReaderAsync(ct);
++        while (await rd.ReadAsync(ct))
++        {
++            var name = rd.GetString(0);
++            if (_excluded.IsMatch(name))
++                continue;
++            if (history is not null && string.Equals(name, history, StringComparison.OrdinalIgnoreCase))
++                continue;
++
++            result.Add(new BackupTarget(name, rd.GetString(1), rd.GetInt64(2)));
++        }
++
++        return result;
++    }
++
++    /// <summary>Confere se o nome informado está entre os bancos elegíveis.</summary>
++    public async Task<string> ResolveTargetAsync(string database, CancellationToken ct = default)
++    {
++        var targets = await ListTargetsAsync(ct);
++        var match = targets.FirstOrDefault(t => string.Equals(t.Name, database, StringComparison.OrdinalIgnoreCase))
++            ?? throw new RestoreValidationException(
++                $"O banco '{database}' não está disponível para backup.", StatusCodes.Status403Forbidden);
++
++        if (!string.Equals(match.State, "ONLINE", StringComparison.OrdinalIgnoreCase))
++            throw new RestoreValidationException(
++                $"O banco '{match.Name}' está em estado {match.State} e não pode ser copiado.");
++
++        return match.Name;
++    }
++
++    /// <summary>BACKUP COPY_ONLY do banco. Nome: banco_DDMMAAAA_HHmm.bak.</summary>
++    public async Task<BackupFileResult> BackupAsync(
++        string database, Action<int> onSessionStarted, CancellationToken ct = default)
++    {
++        if (string.IsNullOrWhiteSpace(_options.Path))
++            throw new RestoreValidationException("Configure Backup:Path antes de executar backups.");
++
++        var fileName = $"{database}_{DateTime.Now:ddMMyyyy_HHmm}.bak";
++        var path = _options.Path.TrimEnd('\\', '/') + "\\" + fileName;
++
++        await using var cn = await _connections.OpenMasterAsync(ct);
++        onSessionStarted(await GetSessionIdAsync(cn, ct));
++
++        _logger.LogInformation("Backup de {Database} em {Path}.", database, path);
++
++        try
++        {
++            await ExecuteBackupAsync(cn, database, path, _options.Compression, ct);
++        }
++        catch (SqlException ex) when (_options.Compression)
++        {
++            _logger.LogWarning(ex, "Backup com COMPRESSION falhou; repetindo sem compressão.");
++            await ExecuteBackupAsync(cn, database, path, compression: false, ct);
++        }
++
++        return new BackupFileResult(path, await GetBackupSizeAsync(cn, path, ct));
++    }
++
++    /// <summary>Remove backups mais antigos que a retenção (xp_delete_file).</summary>
++    public async Task CleanupAsync(CancellationToken ct = default)
++    {
++        if (_options.RetentionDays <= 0 || string.IsNullOrWhiteSpace(_options.Path))
++            return;
++
++        await using var cn = await _connections.OpenMasterAsync(ct);
++        await using var cmd = cn.CreateCommand();
++        cmd.CommandTimeout = 300;
++        cmd.CommandText = "EXEC master.dbo.xp_delete_file 0, @folder, N'BAK', @cutoff, 0;";
++        cmd.Parameters.Add("@folder", SqlDbType.NVarChar, 1024).Value = _options.Path.TrimEnd('\\', '/') + "\\";
++        cmd.Parameters.Add("@cutoff", SqlDbType.DateTime).Value = DateTime.Now.AddDays(-_options.RetentionDays);
++
++        await cmd.ExecuteNonQueryAsync(ct);
++        _logger.LogInformation("Backups anteriores a {Days} dias removidos de {Path}.",
++            _options.RetentionDays, _options.Path);
++    }
++
++    private async Task ExecuteBackupAsync(
++        SqlConnection cn, string database, string path, bool compression, CancellationToken ct)
++    {
++        var options = new List<string> { "COPY_ONLY", "INIT", "STATS = 5" };
++        if (compression) options.Insert(1, "COMPRESSION");
++        if (_options.Checksum) options.Insert(1, "CHECKSUM");
++
++        await using var cmd = cn.CreateCommand();
++        cmd.CommandText = $"BACKUP DATABASE @db TO DISK = @path WITH {string.Join(", ", options)};";
++        cmd.CommandTimeout = 0;
++        cmd.Parameters.Add("@db", SqlDbType.NVarChar, 128).Value = database;
++        cmd.Parameters.Add("@path", SqlDbType.NVarChar, 1024).Value = path;
++        await cmd.ExecuteNonQueryAsync(ct);
++    }
++
++    private static async Task<long> GetBackupSizeAsync(SqlConnection cn, string path, CancellationToken ct)
++    {
++        try
++        {
++            await using var cmd = cn.CreateCommand();
++            cmd.CommandTimeout = 60;
++            cmd.CommandText = """
++                SELECT TOP (1) CAST(bs.compressed_backup_size AS bigint)
++                FROM msdb.dbo.backupmediafamily AS bmf
++                JOIN msdb.dbo.backupset AS bs ON bs.media_set_id = bmf.media_set_id
++                WHERE bmf.physical_device_name = @path
++                ORDER BY bs.backup_finish_date DESC;
++                """;
++            cmd.Parameters.Add("@path", SqlDbType.NVarChar, 1024).Value = path;
++            return Convert.ToInt64(await cmd.ExecuteScalarAsync(ct) ?? 0L);
++        }
++        catch
++        {
++            return 0;
++        }
++    }
++
++    private static async Task<int> GetSessionIdAsync(SqlConnection cn, CancellationToken ct)
++    {
++        await using var cmd = cn.CreateCommand();
++        cmd.CommandText = "SELECT CAST(@@SPID AS int);";
++        cmd.CommandTimeout = 60;
++        return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
++    }
++}
+diff --git a/Services/Jobs/RestoreQueue.cs b/Services/Jobs/RestoreQueue.cs
+index 0481fb9..a321920 100644
+--- a/Services/Jobs/RestoreQueue.cs
++++ b/Services/Jobs/RestoreQueue.cs
+@@ -23,6 +23,9 @@ public sealed class RestoreQueue
+ 
+     public bool IsJobActive(Guid jobId) => _reservations.Values.Contains(jobId);
+ 
++    /// <summary>Há restore na fila ou em andamento nesta instância.</summary>
++    public bool HasActiveJobs => !_reservations.IsEmpty;
++
+     public ValueTask EnqueueAsync(RestoreJob job, CancellationToken ct = default) =>
+         _channel.Writer.WriteAsync(job, ct);
+ 
+diff --git a/Services/Notifications/RestoreHub.cs b/Services/Notifications/RestoreHub.cs
+index af3ef79..6f39b36 100644
+--- a/Services/Notifications/RestoreHub.cs
++++ b/Services/Notifications/RestoreHub.cs
+@@ -15,4 +15,12 @@ public sealed class RestoreHub : Hub
+ 
+         return Groups.AddToGroupAsync(Context.ConnectionId, RestoreNotifier.GroupName(id));
+     }
++
++    public Task JoinBackup(string runId)
++    {
++        if (!Guid.TryParse(runId, out var id))
++            throw new HubException("RunId inválido.");
++
++        return Groups.AddToGroupAsync(Context.ConnectionId, Services.Backup.BackupNotifier.GroupName(id));
++    }
+ }
+diff --git a/Services/Sql/LogMaintenance.cs b/Services/Sql/LogMaintenance.cs
+new file mode 100644
+index 0000000..8766073
+--- /dev/null
++++ b/Services/Sql/LogMaintenance.cs
+@@ -0,0 +1,138 @@
++using System.Data;
++using Microsoft.Data.SqlClient;
++
++namespace SqlRestoreManager.Services.Sql;
++
++public sealed record LogShrinkResult(int? BeforeMB, int? AfterMB, string Message);
++
++/// <summary>
++/// RECOVERY SIMPLE + CHECKPOINT + DBCC SHRINKFILE nos arquivos de log.
++/// Usado pelo pós-restore e antes do backup.
++/// </summary>
++public sealed class LogMaintenance
++{
++    private readonly SqlConnectionFactory _connections;
++    private readonly ILogger<LogMaintenance> _logger;
++
++    public LogMaintenance(SqlConnectionFactory connections, ILogger<LogMaintenance> logger)
++    {
++        _connections = connections;
++        _logger = logger;
++    }
++
++    public async Task<LogShrinkResult> ShrinkAsync(
++        string database, int targetSizeMB, int growthMB, bool setRecoverySimple, int timeoutSeconds)
++    {
++        var before = await GetLogSizeMbAsync(database, timeoutSeconds);
++
++        if (setRecoverySimple)
++        {
++            await using var master = await _connections.OpenMasterAsync(CancellationToken.None);
++            await ExecuteAsync(master,
++                $"ALTER DATABASE {QuoteName(database)} SET RECOVERY SIMPLE WITH NO_WAIT;", timeoutSeconds);
++        }
++
++        await using var cn = await OpenDatabaseAsync(database);
++        var messages = new List<string>();
++
++        foreach (var (fileId, name) in await GetLogFilesAsync(cn, timeoutSeconds))
++        {
++            for (var pass = 0; pass < 2; pass++)
++            {
++                await ExecuteAsync(cn, "CHECKPOINT;", timeoutSeconds);
++                // Valores inteiros: sem risco de injeção.
++                await ExecuteAsync(cn, $"DBCC SHRINKFILE ({fileId}, {targetSizeMB}) WITH NO_INFOMSGS;", timeoutSeconds);
++
++                if (await GetFileSizeMbAsync(cn, fileId, timeoutSeconds) <= targetSizeMB)
++                    break;
++            }
++
++            if (growthMB > 0)
++                await ExecuteAsync(cn,
++                    $"ALTER DATABASE CURRENT MODIFY FILE (NAME = {QuoteName(name)}, FILEGROWTH = {growthMB}MB);",
++                    timeoutSeconds);
++
++            messages.Add($"{name} = {await GetFileSizeMbAsync(cn, fileId, timeoutSeconds)} MB");
++        }
++
++        var after = await GetLogSizeMbAsync(database, timeoutSeconds);
++        var result = new LogShrinkResult(before, after, string.Join("; ", messages));
++
++        _logger.LogInformation("Log de {Database}: {Before} MB → {After} MB.", database, before, after);
++        return result;
++    }
++
++    public async Task<int?> GetLogSizeMbAsync(string database, int timeoutSeconds)
++    {
++        await using var cn = await _connections.OpenMasterAsync(CancellationToken.None);
++        await using var cmd = Command(cn, """
++            SELECT CAST(SUM(CAST(size AS bigint)) * 8 / 1024 AS int)
++            FROM sys.master_files
++            WHERE database_id = DB_ID(@db) AND type = 1;
++            """, timeoutSeconds);
++        cmd.Parameters.Add("@db", SqlDbType.NVarChar, 128).Value = database;
++        return await cmd.ExecuteScalarAsync(CancellationToken.None) is int mb ? mb : null;
++    }
++
++    public async Task<string> GetLogReuseWaitAsync(string database, int timeoutSeconds)
++    {
++        await using var cn = await _connections.OpenMasterAsync(CancellationToken.None);
++        await using var cmd = Command(cn,
++            "SELECT log_reuse_wait_desc FROM sys.databases WHERE name = @db;", timeoutSeconds);
++        cmd.Parameters.Add("@db", SqlDbType.NVarChar, 128).Value = database;
++        return await cmd.ExecuteScalarAsync(CancellationToken.None) as string ?? "?";
++    }
++
++    private static async Task<List<(int FileId, string Name)>> GetLogFilesAsync(SqlConnection cn, int timeoutSeconds)
++    {
++        await using var cmd = Command(cn,
++            "SELECT file_id, name FROM sys.database_files WHERE type = 1 ORDER BY file_id;", timeoutSeconds);
++
++        var files = new List<(int, string)>();
++        await using var rd = await cmd.ExecuteReaderAsync(CancellationToken.None);
++        while (await rd.ReadAsync(CancellationToken.None))
++            files.Add((rd.GetInt32(0), rd.GetString(1)));
++
++        return files;
++    }
++
++    private static async Task<int> GetFileSizeMbAsync(SqlConnection cn, int fileId, int timeoutSeconds)
++    {
++        await using var cmd = Command(cn,
++            "SELECT CAST(CAST(size AS bigint) * 8 / 1024 AS int) FROM sys.database_files WHERE file_id = @id;",
++            timeoutSeconds);
++        cmd.Parameters.Add("@id", SqlDbType.Int).Value = fileId;
++        return Convert.ToInt32(await cmd.ExecuteScalarAsync(CancellationToken.None));
++    }
++
++    private async Task<SqlConnection> OpenDatabaseAsync(string database)
++    {
++        var cn = await _connections.OpenMasterAsync(CancellationToken.None);
++        try
++        {
++            await cn.ChangeDatabaseAsync(database, CancellationToken.None);
++            return cn;
++        }
++        catch
++        {
++            await cn.DisposeAsync();
++            throw;
++        }
++    }
++
++    private static SqlCommand Command(SqlConnection cn, string sql, int timeoutSeconds)
++    {
++        var cmd = cn.CreateCommand();
++        cmd.CommandText = sql;
++        cmd.CommandTimeout = timeoutSeconds;
++        return cmd;
++    }
++
++    private static async Task ExecuteAsync(SqlConnection cn, string sql, int timeoutSeconds)
++    {
++        await using var cmd = Command(cn, sql, timeoutSeconds);
++        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
++    }
++
++    private static string QuoteName(string value) => "[" + value.Replace("]", "]]") + "]";
++}
+diff --git a/Services/Sql/WildcardMatcher.cs b/Services/Sql/WildcardMatcher.cs
+new file mode 100644
+index 0000000..46cfe0e
+--- /dev/null
++++ b/Services/Sql/WildcardMatcher.cs
+@@ -0,0 +1,27 @@
++using System.Text.RegularExpressions;
++
++namespace SqlRestoreManager.Services.Sql;
++
++/// <summary>Padrões com * e ?, sem diferenciar maiúsculas (usado em bloqueios/exclusões).</summary>
++public sealed class WildcardMatcher
++{
++    private readonly Regex[] _patterns;
++
++    public WildcardMatcher(IEnumerable<string> patterns)
++    {
++        _patterns = patterns
++            .Where(p => !string.IsNullOrWhiteSpace(p))
++            .Select(ToRegex)
++            .ToArray();
++    }
++
++    public bool IsMatch(string value) => _patterns.Any(r => r.IsMatch(value));
++
++    private static Regex ToRegex(string pattern)
++    {
++        var body = Regex.Escape(pattern.Trim())
++            .Replace(@"\*", ".*")
++            .Replace(@"\?", ".");
++        return new Regex($"^{body}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
++    }
++}
+diff --git a/Views/Backup/Index.cshtml b/Views/Backup/Index.cshtml
+new file mode 100644
+index 0000000..29ad2c0
+--- /dev/null
++++ b/Views/Backup/Index.cshtml
+@@ -0,0 +1,316 @@
++@model BackupIndexViewModel
++@{
++    ViewData["Title"] = "Backup";
++}
++@functions {
++    static string BadgeClass(string status) => status switch
++    {
++        BackupStatus.Success => "badge-ok",
++        BackupStatus.Warning => "badge-warn",
++        BackupStatus.Error => "badge-error",
++        _ => "badge-active"
++    };
++}
++<section class="card">
++    <h1>Backup dos bancos</h1>
++    <p class="card-lead">
++        Gera um <b>BACKUP COPY_ONLY</b> de cada banco selecionado em <code>@Model.BackupPath</code>,
++        com o nome <code>banco_DDMMAAAA_HHmm.bak</code>.
++        @if (Model.ShrinkLogBefore)
++        {
++            <text>O log é reduzido antes de cada backup.</text>
++        }
++        @if (Model.RetentionDays > 0)
++        {
++            <text>Arquivos com mais de @Model.RetentionDays dias são removidos ao final.</text>
++        }
++    </p>
++
++    @if (!Model.Enabled)
++    {
++        <div class="alert alert-warn">O módulo de backup está desabilitado (<code>Backup:Enabled</code>).</div>
++    }
++    else if (Model.LoadError is not null)
++    {
++        <div class="alert alert-error">Não foi possível listar os bancos. @Model.LoadError</div>
++    }
++    else
++    {
++        <div id="restoreBlock" class="alert alert-warn @(Model.RestoreInProgress ? "" : "hidden")">
++            Há um <b>restore em andamento</b>. O backup só pode ser iniciado depois que ele terminar.
++        </div>
++
++        <form id="backupForm" novalidate>
++            <div class="field">
++                <span class="label">Bancos (@Model.Targets.Count)</span>
++                <div class="actions" style="margin-top:0">
++                    <button type="button" id="btnAll" class="btn-ghost btn-small">Marcar todos</button>
++                    <button type="button" id="btnNone" class="btn-ghost btn-small">Desmarcar todos</button>
++                </div>
++                <div class="checklist">
++                    @foreach (var target in Model.Targets)
++                    {
++                        var online = string.Equals(target.State, "ONLINE", StringComparison.OrdinalIgnoreCase);
++                        <label class="check" style="margin-top:0">
++                            @if (online)
++                            {
++                                <input type="checkbox" name="databases" value="@target.Name" checked />
++                            }
++                            else
++                            {
++                                <input type="checkbox" name="databases" value="@target.Name" disabled />
++                            }
++                            <span>
++                                @target.Name
++                                <span class="sub">@target.SizeMB.ToString("N0") MB@(online ? "" : $" · {target.State}")</span>
++                            </span>
++                        </label>
++                    }
++                </div>
++            </div>
++
++            <div class="actions">
++                <button type="submit" id="btnBackup">Fazer backup agora</button>
++            </div>
++        </form>
++
++        <div id="console" class="console hidden">
++            <div class="console-row">
++                <div class="console-head"><b>Backup</b><span class="console-value" id="backupValue">0%</span></div>
++                <div class="track" id="backupTrack"><div id="backupBar"></div></div>
++                <div class="console-note" id="backupText">Iniciando...</div>
++            </div>
++        </div>
++
++        <div id="error" class="alert alert-error hidden" role="alert"></div>
++        <div id="success" class="alert alert-ok hidden" role="status"></div>
++    }
++</section>
++
++<section class="card wide">
++    <h2>Últimas execuções</h2>
++    @if (Model.Runs.Count == 0)
++    {
++        <p class="muted">Nenhum backup executado ainda.</p>
++    }
++    else
++    {
++        <div class="table-scroll">
++            <table>
++                <thead>
++                    <tr>
++                        <th>Início</th>
++                        <th>Origem</th>
++                        <th>Status</th>
++                        <th>Bancos</th>
++                        <th>Tamanho</th>
++                        <th>Fim</th>
++                        <th>Instância</th>
++                    </tr>
++                </thead>
++                <tbody>
++                    @foreach (var run in Model.Runs)
++                    {
++                        <tr>
++                            <td class="num">@run.StartedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
++                            <td>@(run.Trigger == BackupTrigger.Scheduled ? "Agendado" : "Manual")</td>
++                            <td>
++                                <span class="badge @BadgeClass(run.Status)">@BackupStatus.ToLabel(run.Status)</span>
++                                @if (!string.IsNullOrWhiteSpace(run.CurrentStep))
++                                {
++                                    <div class="sub">@run.CurrentStep</div>
++                                }
++                            </td>
++                            <td class="num">@run.SucceededCount/@run.TotalDatabases</td>
++                            <td class="num">@((run.TotalSizeBytes / 1024d / 1024d).ToString("N0")) MB</td>
++                            <td class="num">@(run.FinishedAt?.ToString("dd/MM/yyyy HH:mm:ss") ?? "-")</td>
++                            <td>@(run.NodeName ?? "-")</td>
++                        </tr>
++                        if (!string.IsNullOrWhiteSpace(run.ErrorMessage))
++                        {
++                            <tr><td colspan="7"><div class="alert alert-error">@run.ErrorMessage</div></td></tr>
++                        }
++                        if (run.Items.Count > 0)
++                        {
++                            <tr>
++                                <td colspan="7">
++                                    <details open="@(run.FailedCount > 0 ? "open" : null)">
++                                        <summary>Bancos desta execução</summary>
++                                        <table>
++                                            <tbody>
++                                                @foreach (var item in run.Items.OrderBy(i => i.DatabaseName))
++                                                {
++                                                    <tr>
++                                                        <td>@item.DatabaseName</td>
++                                                        <td><span class="badge @BadgeClass(item.Status)">@BackupStatus.ToLabel(item.Status)</span></td>
++                                                        <td class="num">@((item.SizeBytes / 1024d / 1024d).ToString("N0")) MB</td>
++                                                        <td class="num">
++                                                            @if (item.LogSizeBeforeMB is not null)
++                                                            {
++                                                                <text>log @item.LogSizeBeforeMB → @item.LogSizeAfterMB MB</text>
++                                                            }
++                                                        </td>
++                                                        <td class="num">@item.DurationSeconds.ToString("N0") s</td>
++                                                        <td>
++                                                            @item.FilePath
++                                                            @if (!string.IsNullOrWhiteSpace(item.ErrorMessage))
++                                                            {
++                                                                <div class="sub">@item.ErrorMessage</div>
++                                                            }
++                                                        </td>
++                                                    </tr>
++                                                }
++                                            </tbody>
++                                        </table>
++                                    </details>
++                                </td>
++                            </tr>
++                        }
++                    }
++                </tbody>
++            </table>
++        </div>
++    }
++</section>
++
++@section Scripts {
++<script src="~/lib/signalr/signalr.min.js" asp-append-version="true"></script>
++<script>
++(() => {
++    "use strict";
++    const form = document.getElementById("backupForm");
++    if (!form) return;
++
++    const urls = {
++        start: "@Url.Action("Start", "Backup")",
++        status: "@Url.Action("Status", "Backup")",
++        hub: "@Url.Content("~/restoreHub")"
++    };
++
++    const $ = id => document.getElementById(id);
++    const submitButton = $("btnBackup");
++    const errorBox = $("error");
++    const successBox = $("success");
++
++    let currentRunId = @(Model.CurrentRunId is null ? "null" : $"\"{Model.CurrentRunId}\"");
++    let finished = currentRunId === null;
++
++    const show = (node, text) => { node.textContent = text; node.classList.remove("hidden"); };
++    const hide = node => { node.textContent = ""; node.classList.add("hidden"); };
++
++    function setProgress(percent, running) {
++        const value = Math.max(0, Math.min(100, percent));
++        $("backupBar").style.width = `${value}%`;
++        $("backupValue").textContent = `${value.toFixed(0)}%`;
++        $("backupTrack").classList.toggle("running", running === true && value < 100);
++    }
++
++    function finish(ok, message, hasWarnings) {
++        finished = true;
++        submitButton.disabled = false;
++        setProgress(100, false);
++        if (ok) {
++            show(successBox, message);
++            ui.toast(message, { type: hasWarnings ? "warn" : "ok", timeout: hasWarnings ? 0 : 9000 });
++            setTimeout(() => location.reload(), 3000);
++        } else {
++            show(errorBox, message);
++            ui.toast(message, { type: "error", timeout: 0 });
++        }
++    }
++
++    const connection = new signalR.HubConnectionBuilder().withUrl(urls.hub).withAutomaticReconnect().build();
++
++    connection.on("BackupProgress", m => {
++        if (m.runId !== currentRunId || finished) return;
++        setProgress(m.percent, true);
++        $("backupText").textContent = m.message;
++    });
++    connection.on("BackupCompleted", m => {
++        if (m.runId !== currentRunId || finished) return;
++        finish(true, m.message, m.hasWarnings);
++    });
++    connection.on("BackupFailed", m => {
++        if (m.runId !== currentRunId || finished) return;
++        finish(false, m.message, false);
++    });
++    connection.onreconnected(async () => { await join(); await refresh(); });
++
++    const started = connection.start().catch(err => console.error(err));
++
++    async function join() {
++        if (!currentRunId || connection.state !== signalR.HubConnectionState.Connected) return;
++        try { await connection.invoke("JoinBackup", currentRunId); } catch (err) { console.error(err); }
++    }
++
++    async function refresh() {
++        if (!currentRunId || finished) return;
++        try {
++            const response = await fetch(`${urls.status}?runId=${encodeURIComponent(currentRunId)}`);
++            if (!response.ok) return;
++            const s = await response.json();
++            if (finished) return;
++
++            setProgress(s.percentComplete, true);
++            $("backupText").textContent = s.currentStep || s.status;
++            if (s.status === "Success") finish(true, "Backup concluído.", false);
++            else if (s.status === "Warning") finish(true, `Backup concluído com ${s.failedCount} falha(s).`, true);
++            else if (s.status === "Error") finish(false, s.errorMessage || "Falha no backup.", false);
++        } catch (err) { console.error(err); }
++    }
++
++    setInterval(() => {
++        if (currentRunId && !finished && connection.state !== signalR.HubConnectionState.Connected) refresh();
++    }, 5000);
++
++    $("btnAll").addEventListener("click", () => toggleAll(true));
++    $("btnNone").addEventListener("click", () => toggleAll(false));
++    function toggleAll(checked) {
++        for (const box of form.querySelectorAll('input[name="databases"]:not(:disabled)')) box.checked = checked;
++    }
++
++    form.addEventListener("submit", async e => {
++        e.preventDefault();
++        hide(errorBox);
++        hide(successBox);
++
++        const selected = [...form.querySelectorAll('input[name="databases"]:checked')].map(b => b.value);
++        if (!selected.length) return show(errorBox, "Selecione ao menos um banco.");
++
++        const confirmed = await ui.confirm({
++            title: `Fazer backup de ${selected.length} banco(s)?`,
++            message: "Os logs serão reduzidos antes de cada backup e os arquivos irão para a pasta configurada.",
++            confirmText: "Iniciar backup"
++        });
++        if (!confirmed) return;
++
++        submitButton.disabled = true;
++        finished = false;
++        setProgress(0, true);
++        $("backupText").textContent = "Iniciando...";
++        $("console").classList.remove("hidden");
++
++        try {
++            await started;
++            const data = new FormData();
++            for (const name of selected) data.append("databases", name);
++
++            const response = await fetch(urls.start, { method: "POST", body: data });
++            if (!response.ok) throw new Error(await response.text() || `Falha (HTTP ${response.status}).`);
++
++            currentRunId = (await response.json()).runId;
++            await join();
++            await refresh();
++        } catch (err) {
++            finish(false, err.message, false);
++        }
++    });
++
++    if (currentRunId) {
++        $("console").classList.remove("hidden");
++        submitButton.disabled = true;
++        started.then(join).then(refresh);
++    }
++})();
++</script>
++}
+diff --git a/Views/Shared/_Layout.cshtml b/Views/Shared/_Layout.cshtml
+index a0a71ea..3296449 100644
+--- a/Views/Shared/_Layout.cshtml
++++ b/Views/Shared/_Layout.cshtml
+@@ -14,6 +14,7 @@
+     <span class="brand">SQL Restore Manager</span>
+     <nav>
+         <a asp-controller="Restore" asp-action="Index" aria-current="@(action == "Restore" ? "page" : null)">Restaurar</a>
++        <a asp-controller="Backup" asp-action="Index" aria-current="@(action == "Backup" ? "page" : null)">Backup</a>
+         <a asp-controller="History" asp-action="Index" aria-current="@(action == "History" ? "page" : null)">Histórico</a>
+     </nav>
+ </header>
+diff --git a/wwwroot/css/site.css b/wwwroot/css/site.css
+index f6dce3a..793aa15 100644
+--- a/wwwroot/css/site.css
++++ b/wwwroot/css/site.css
+@@ -344,3 +344,18 @@ dialog.modal::backdrop { background: rgba(14, 22, 30, .55); }
+ }
+ .btn-link:hover { background: #f1f4f8; }
+ .pager { display: flex; align-items: center; gap: 14px; margin-top: 18px; font-size: 14px; }
++.checklist {
++    display: grid;
++    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
++    gap: 8px 18px;
++    margin-top: 10px;
++    max-height: 320px;
++    overflow-y: auto;
++    border: 1px solid var(--line);
++    border-radius: var(--radius-sm);
++    padding: 12px 14px;
++}
++.checklist .sub { display: block; }
++code { font-family: var(--mono); font-size: 12.5px; background: #f1f4f8; padding: 1px 5px; border-radius: 4px; }
++details table { margin-top: 6px; }
++details table td { border-bottom: 1px dashed var(--line); font-size: 13px; }
+-- 
+2.43.0
+

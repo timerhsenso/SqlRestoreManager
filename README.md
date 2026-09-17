@@ -39,6 +39,13 @@ se encarrega de aceitar o que vier, restaurar com segurança e deixar o banco pr
 - Corrige usuários órfãos.
 - Executa scripts `.sql` seus, globais ou por banco.
 
+**Backup dos bancos**
+- Aba própria, com seleção dos bancos de usuário (sistema nunca entra).
+- Limpeza do log antes de cada backup e `BACKUP ... WITH COPY_ONLY, COMPRESSION, CHECKSUM`.
+- Arquivos no padrão `banco_DDMMAAAA_HHmm.bak`, com retenção automática.
+- Backup e restore nunca rodam ao mesmo tempo.
+- Histórico por execução e por banco, com tamanho, duração e erro.
+
 **Histórico**
 - Registro completo de cada job, com etapas, alertas e tamanho do log antes e depois.
 - Busca, filtro por status, paginação e exportação CSV.
@@ -61,7 +68,7 @@ se encarrega de aceitar o que vier, restaurar com segurança e deixar o banco pr
 
 1. **Banco de histórico** — execute, em ordem, os scripts de `Database/`:
    `001_RestoreHistory.sql`, `002_RestoreHistory_PostRestore.sql`,
-   `003_RestoreHistory_SafetyBackup.sql`. São idempotentes.
+   `003_RestoreHistory_SafetyBackup.sql` e `004_Backup.sql`. São idempotentes.
 2. **Pastas** — crie a pasta temporária e, se for usar, a de backups e a de backups de segurança.
    A conta do serviço SQL Server precisa de leitura na pasta temporária e de escrita nas pastas
    de dados e log.
@@ -115,6 +122,19 @@ O `web.config` do projeto já libera uploads de até ~4 GB (o padrão do IIS é 
 | `CommandTimeoutMinutes` | `30` | Timeout de cada comando do pós-restore. |
 
 Configuração inválida impede a aplicação de subir (`ValidateOnStart`), com a mensagem do que corrigir.
+
+## Backup (`Backup`)
+
+| Chave | Padrão | Descrição |
+|---|---|---|
+| `Enabled` | `true` | Habilita a aba e a execução. |
+| `Path` | vazio | Pasta dos `.bak`, vista pelo SQL Server. Obrigatória quando habilitado. |
+| `ExcludedDatabases` | vazio | Bancos fora do backup. Aceita `*` e `?`. |
+| `Compression` / `Checksum` | `true` | Opções do `BACKUP`. |
+| `RetentionDays` | `7` | Apaga `.bak` mais antigos ao final da execução. 0 = nunca. |
+| `ShrinkLogBefore` | `true` | `RECOVERY SIMPLE` + shrink do log antes de cada backup. |
+| `LogTargetSizeMB` / `LogGrowthMB` | `512` / `256` | Alvo e crescimento do log. |
+| `CommandTimeoutMinutes` | `120` | Timeout dos comandos. |
 
 ## Aplicação em outra máquina (desenvolvimento)
 

@@ -344,3 +344,18 @@ dialog.modal::backdrop { background: rgba(14, 22, 30, .55); }
 }
 .btn-link:hover { background: #f1f4f8; }
 .pager { display: flex; align-items: center; gap: 14px; margin-top: 18px; font-size: 14px; }
+.checklist {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 8px 18px;
+    margin-top: 10px;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+}
+.checklist .sub { display: block; }
+code { font-family: var(--mono); font-size: 12.5px; background: #f1f4f8; padding: 1px 5px; border-radius: 4px; }
+details table { margin-top: 6px; }
+details table td { border-bottom: 1px dashed var(--line); font-size: 13px; }

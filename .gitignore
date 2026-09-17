@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# Pastas do projeto que colidem com o padrão Backup*/ acima
+!Services/Backup/
+!Views/Backup/

@@ -15,4 +15,12 @@ public sealed class RestoreHub : Hub
 
         return Groups.AddToGroupAsync(Context.ConnectionId, RestoreNotifier.GroupName(id));
     }
+
+    public Task JoinBackup(string runId)
+    {
+        if (!Guid.TryParse(runId, out var id))
+            throw new HubException("RunId inválido.");
+
+        return Groups.AddToGroupAsync(Context.ConnectionId, Services.Backup.BackupNotifier.GroupName(id));
+    }
 }

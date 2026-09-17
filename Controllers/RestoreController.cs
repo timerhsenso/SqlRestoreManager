@@ -6,6 +6,7 @@ using SqlRestoreManager.Configuration;
 using SqlRestoreManager.Data;
 using SqlRestoreManager.Filters;
 using SqlRestoreManager.Models;
+using SqlRestoreManager.Services.Backup;
 using SqlRestoreManager.Services.Jobs;
 using SqlRestoreManager.Services.Sql;
 using SqlRestoreManager.Services.Uploads;
@@ -24,6 +25,7 @@ public sealed class RestoreController : Controller
     private readonly SqlRestoreService _sql;
     private readonly BackupUploadService _uploads;
     private readonly BackupLibrary _library;
+    private readonly BackupRunner _backups;
     private readonly BackupExtractor _extractor;
     private readonly RestoreOptions _options;
     private readonly ILogger<RestoreController> _logger;
@@ -36,6 +38,7 @@ public sealed class RestoreController : Controller
         SqlRestoreService sql,
         BackupUploadService uploads,
         BackupLibrary library,
+        BackupRunner backups,
         BackupExtractor extractor,
         IOptions<RestoreOptions> options,
         ILogger<RestoreController> logger)
@@ -47,6 +50,7 @@ public sealed class RestoreController : Controller
         _sql = sql;
         _uploads = uploads;
         _library = library;
+        _backups = backups;
         _extractor = extractor;
         _options = options.Value;
         _logger = logger;
@@ -134,6 +138,9 @@ public sealed class RestoreController : Controller
             _logger.LogError(ex, "Falha ao validar o restore a partir da pasta.");
             return StatusCode(StatusCodes.Status503ServiceUnavailable, SqlErrorTranslator.Translate(ex));
         }
+
+        if (_backups.IsRunning)
+            return Conflict("Há um backup em andamento. Aguarde o término para restaurar.");
 
         var jobId = Guid.NewGuid();
         if (!_queue.TryReserve(database, jobId))
@@ -263,6 +270,9 @@ public sealed class RestoreController : Controller
         }
 
         ConfigureRequestBodyLimit();
+
+        if (_backups.IsRunning)
+            return Conflict("Há um backup em andamento. Aguarde o término para restaurar.");
 
         var jobId = Guid.NewGuid();
         if (!_queue.TryReserve(database, jobId))

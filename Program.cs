@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using SqlRestoreManager.Configuration;
 using SqlRestoreManager.Data;
+using SqlRestoreManager.Services.Backup;
 using SqlRestoreManager.Services.Jobs;
 using SqlRestoreManager.Services.Notifications;
 using SqlRestoreManager.Services.Sql;
@@ -19,6 +20,12 @@ builder.Services
     .Bind(builder.Configuration.GetSection(RestoreOptions.SectionName))
     .ValidateOnStart();
 builder.Services.AddSingleton<IValidateOptions<RestoreOptions>, RestoreOptionsValidator>();
+
+builder.Services
+    .AddOptions<BackupOptions>()
+    .Bind(builder.Configuration.GetSection(BackupOptions.SectionName))
+    .ValidateOnStart();
+builder.Services.AddSingleton<IValidateOptions<BackupOptions>, BackupOptionsValidator>();
 
 // Exceção em BackgroundService não derruba a aplicação; tempo extra no shutdown.
 builder.Services.Configure<HostOptions>(o =>
@@ -43,6 +50,10 @@ builder.Services.AddSingleton<DatabaseCatalog>();
 builder.Services.AddSingleton<BackupPathMapper>();
 builder.Services.AddSingleton<SqlRestoreService>();
 builder.Services.AddSingleton<PostRestoreService>();
+builder.Services.AddSingleton<LogMaintenance>();
+builder.Services.AddSingleton<BackupService>();
+builder.Services.AddSingleton<BackupNotifier>();
+builder.Services.AddSingleton<BackupRunner>();
 builder.Services.AddSingleton<BackupExtractor>();
 builder.Services.AddSingleton<BackupLibrary>();
 builder.Services.AddSingleton<BackupUploadService>();
